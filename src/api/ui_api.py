@@ -8,14 +8,14 @@ import time
 from urllib.parse import urlparse, urlunparse, quote, unquote
 import logging
 
-from datetime import timedelta, datetime, timezone
-from sqlalchemy import update, select, func
+from datetime import datetime
+from sqlalchemy import update, select, func, exc
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 import httpx
 from ..rate_limiter import RateLimiter, RateLimitExceededError
 from ..config_manager import ConfigManager
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status, Response
 from fastapi.security import OAuth2PasswordRequestForm
 
@@ -32,6 +32,7 @@ from ..image_utils import download_image
 from ..scheduler import SchedulerManager
 from thefuzz import fuzz
 from ..config import settings
+from ..timezone import get_now
 from ..database import get_db_session
 
 router = APIRouter()
@@ -271,6 +272,28 @@ async def search_anime_provider(
         search_episode=episode_to_filter
     )
 
+@router.post("/library/anime", response_model=models.LibraryAnimeInfo, status_code=201, summary="创建自定义作品条目")
+async def create_anime_entry(
+    payload: models.AnimeCreate,
+    current_user: models.User = Depends(security.get_current_user),
+    session: AsyncSession = Depends(get_db_session)
+):
+    """
+    手动创建一个新的作品条目，不关联任何数据源。
+    """
+    try:
+        new_anime = await crud.create_anime(session, payload)
+        await session.commit()
+        # We need to return a LibraryAnimeInfo, so we fetch the full details
+        # with counts.
+        details = await crud.get_library_anime_by_id(session, new_anime.id)
+        if not details:
+            # This should not happen, but as a fallback
+            raise HTTPException(status_code=500, detail="创建作品后无法立即获取其信息。")
+        return models.LibraryAnimeInfo.model_validate(details)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
 @router.get("/library/episodes-by-title", response_model=List[int], summary="根据作品标题获取已存在的分集序号")
 async def get_existing_episode_indices(
     title: str = Query(..., description="要查询的作品标题"),
@@ -384,8 +407,7 @@ async def edit_anime_info(
             await metadata_manager.update_tmdb_mappings(
                 tmdb_tv_id=int(update_data.tmdbId),
                 group_id=update_data.tmdbEpisodeGroupId,
-                user=current_user,
-                session=session
+                user=current_user
             )
         except Exception as e:
             # 仅记录错误，不中断主流程，因为核心信息已保存
@@ -416,6 +438,32 @@ async def refresh_anime_poster(
     if affected_rows == 0:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="作品未找到。")
     return {"new_path": new_local_path}
+
+@router.post("/library/anime/{animeId}/sources", response_model=models.SourceInfo, status_code=201, summary="为作品新增数据源")
+async def add_source_to_anime(
+    animeId: int,
+    payload: models.SourceCreate,
+    current_user: models.User = Depends(security.get_current_user),
+    session: AsyncSession = Depends(get_db_session)
+):
+    """
+    为一个已存在的作品手动关联一个新的数据源。
+    """
+    anime = await crud.get_anime_full_details(session, animeId)
+    if not anime:
+        raise HTTPException(status_code=404, detail="作品未找到")
+
+    try:
+        source_id = await crud.link_source_to_anime(session, animeId, payload.providerName, payload.mediaId)
+        await session.commit()
+        all_sources = await crud.get_anime_sources(session, animeId)
+        newly_created_source = next((s for s in all_sources if s['sourceId'] == source_id), None)
+        if not newly_created_source:
+            raise HTTPException(status_code=500, detail="创建数据源后无法立即获取其信息。")
+        return models.SourceInfo.model_validate(newly_created_source)
+    except exc.IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该数据源已存在于此作品下，无法重复添加。")
 
 @router.get("/library/source/{sourceId}/details", response_model=models.SourceDetailsResponse, summary="获取单个数据源的详情")
 async def get_source_details(
@@ -534,7 +582,9 @@ async def get_source_episodes(
     session: AsyncSession = Depends(get_db_session)
 ):
     """获取指定数据源下的所有已收录分集列表。"""
-    return await crud.get_episodes_for_source(session, sourceId)
+    paginated_result = await crud.get_episodes_for_source(session, sourceId)
+    # 修正：从分页结果中提取分集列表，以匹配 response_model
+    return paginated_result.get("episodes", [])
 
 @router.put("/library/episode/{episodeId}", status_code=status.HTTP_204_NO_CONTENT, summary="编辑分集信息")
 async def edit_episode_info(
@@ -543,10 +593,28 @@ async def edit_episode_info(
     current_user: models.User = Depends(security.get_current_user),
     session: AsyncSession = Depends(get_db_session)
 ):
-    """更新指定分集的标题、集数和链接。"""
+    """更新指定分集的标题、集数和链接。对于自定义源，链接是可选的。"""
+    # 1. 获取分集及其源提供商信息
+    # 修正：在更新前先获取分集信息，以进行条件验证
+    episode_info = await crud.get_episode_provider_info(session, episodeId)
+    if not episode_info:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Episode not found")
+
+    # 2. 根据源类型验证输入
+    provider_name = episode_info.get("providerName")
+    if provider_name != 'custom':
+        # 对于非自定义源，链接是必需的
+        if not update_data.sourceUrl:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="对于非自定义源，分集链接(sourceUrl)是必需的。"
+            )
+
+    # 3. 执行更新
     try:
         updated = await crud.update_episode_info(session, episodeId, update_data)
         if not updated:
+            # This case might be redundant if get_episode_provider_info already confirmed existence, but it's safe.
             logger.warning(f"尝试更新一个不存在的分集 (ID: {episodeId})，操作被拒绝。")
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Episode not found")
         logger.info(f"用户 '{current_user.username}' 更新了分集 ID: {episodeId} 的信息。")
@@ -572,6 +640,64 @@ async def reorder_source_episodes(
 
     logger.info(f"用户 '{current_user.username}' 提交了重整源 ID: {sourceId} 集数的任务 (Task ID: {task_id})。")
     return {"message": f"重整集数任务 '{task_title}' 已提交。", "taskId": task_id}
+
+@router.post("/library/episodes/offset", status_code=status.HTTP_202_ACCEPTED, summary="偏移选中分集的集数", response_model=UITaskResponse)
+async def offset_episodes(
+    request_data: models.EpisodeOffsetRequest,
+    current_user: models.User = Depends(security.get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+    task_manager: TaskManager = Depends(get_task_manager)
+):
+    """提交一个后台任务，对选中的分集进行集数偏移。"""
+    if not request_data.episodeIds:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="episodeIds 列表不能为空。")
+    
+    # 1. 在提交任务前，先进行快速验证，以提供即时反馈
+    min_index_res = await session.execute(
+        select(func.min(orm_models.Episode.episodeIndex))
+        .where(orm_models.Episode.id.in_(request_data.episodeIds))
+    )
+    min_index = min_index_res.scalar_one_or_none()
+
+    if min_index is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="找不到任何一个选中的分集。")
+
+    # 2. 检查偏移后的集数是否会小于1
+    if (min_index + request_data.offset) < 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"操作无效：偏移后的最小集数将为 {min_index + request_data.offset}，集数必须大于0。"
+        )
+
+
+    # 获取一个代表性的标题用于任务日志
+    first_episode = await session.get(
+        orm_models.Episode, 
+        request_data.episodeIds[0], 
+        options=[selectinload(orm_models.Episode.source).selectinload(orm_models.AnimeSource.anime)]
+    )
+    # 此检查现在是多余的，因为上面的 min_index 检查已经覆盖了，但保留它以防万一
+    if not first_episode:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="找不到任何一个选中的分集。")
+
+    anime_title = first_episode.source.anime.title
+    provider_name = first_episode.source.providerName
+    offset_str = f"+{request_data.offset}" if request_data.offset >= 0 else str(request_data.offset)
+
+    task_title = f"集数偏移 ({offset_str}): {anime_title} ({provider_name})"
+    task_coro = lambda session, callback: tasks.offset_episodes_task(
+        request_data.episodeIds, request_data.offset, session, callback
+    )
+    
+    unique_key = f"modify-episodes-{first_episode.sourceId}"
+    try:
+        task_id, _ = await task_manager.submit_task(task_coro, task_title, unique_key=unique_key)
+    except HTTPException as e:
+        # 重新抛出由 task_manager 引发的异常 (例如，任务已在运行)
+        raise e
+
+    logger.info(f"用户 '{current_user.username}' 提交了集数偏移任务 (Task ID: {task_id})。")
+    return {"message": f"集数偏移任务 '{task_title}' 已提交。", "taskId": task_id}
 
 
 @router.delete("/library/episode/{episodeId}", status_code=status.HTTP_202_ACCEPTED, summary="提交删除指定分集的任务", response_model=UITaskResponse)
@@ -640,8 +766,9 @@ async def refresh_anime(
     
     if mode == "incremental":
         logger.info(f"用户 '{current_user.username}' 为番剧 '{source_info['title']}' (源ID: {sourceId}) 启动了增量刷新任务。")
-        eps = await crud.get_episodes_for_source(session, sourceId)
-        latest_episode_index = max((ep['episodeIndex'] for ep in eps), default=0)
+        # 修正：crud.get_episodes_for_source 现在返回一个带分页的字典
+        paginated_result = await crud.get_episodes_for_source(session, sourceId, page_size=9999) # 获取所有分集以找到最大集数
+        latest_episode_index = max((ep['episodeIndex'] for ep in paginated_result.get("episodes", [])), default=0)
         next_episode_index = latest_episode_index + 1
         
         task_title = f"增量刷新: {source_info['title']} ({source_info['providerName']}) - 尝试第{next_episode_index}集"
@@ -762,28 +889,24 @@ async def get_metadata_source_settings(
 async def update_metadata_source_settings(
     settings: List[models.MetadataSourceSettingUpdate],
     current_user: models.User = Depends(security.get_current_user),
-    session: AsyncSession = Depends(get_db_session),
     manager: MetadataSourceManager = Depends(get_metadata_manager)
 ):
     """批量更新元数据源的启用状态、辅助搜索状态和显示顺序。"""
-    # 修正：恢复使用专用的 `metadata_sources` 表来存储设置，
-    # 这将调用 `crud.py` 中正确的函数，并解决之前遇到的状态保存问题。
-    await crud.update_metadata_sources_settings(session, settings)
-    # 新增：触发 MetadataSourceManager 重新加载设置，以使更改立即生效。
-    await manager.load_and_sync_sources()
+    # 修正：调用管理器的专用更新方法，而不是直接操作CRUD。
+    # 管理器将负责更新数据库并刷新其内部缓存，确保设置立即生效。
+    await manager.update_source_settings(settings)
     logger.info(f"用户 '{current_user.username}' 更新了元数据源设置，已重新加载。")
 
 @router.put("/scrapers", status_code=status.HTTP_204_NO_CONTENT, summary="更新搜索源的设置")
 async def update_scraper_settings(
     settings: List[models.ScraperSetting],
     current_user: models.User = Depends(security.get_current_user),
-    session: AsyncSession = Depends(get_db_session),
     manager: ScraperManager = Depends(get_scraper_manager)
 ):
     """批量更新搜索源的启用状态和显示顺序。"""
-    await crud.update_scrapers_settings(session, settings)
-    # 更新数据库后，触发 ScraperManager 重新加载搜索源
-    await manager.load_and_sync_scrapers()
+    # 修正：与元数据源类似，调用管理器的专用方法来确保实时性。
+    # 这需要您在 ScraperManager 中也添加一个类似的 update_settings 方法。
+    await manager.update_settings(settings)
     logger.info(f"用户 '{current_user.username}' 更新了搜索源设置，已重新加载。")
     return
 
@@ -798,8 +921,8 @@ async def get_proxy_settings(
     session: AsyncSession = Depends(get_db_session)
 ):
     """获取全局代理配置。"""
-    proxy_url_task = crud.get_config_value(session, "proxy_url", "")
-    proxy_enabled_task = crud.get_config_value(session, "proxy_enabled", "false")
+    proxy_url_task = crud.get_config_value(session, "proxyUrl", "")
+    proxy_enabled_task = crud.get_config_value(session, "proxyEnabled", "false")
     proxy_url, proxy_enabled_str = await asyncio.gather(proxy_url_task, proxy_enabled_task)
 
     proxy_enabled = proxy_enabled_str.lower() == 'true'
@@ -846,11 +969,11 @@ async def update_proxy_settings(
         
         proxy_url = f"{payload.proxyProtocol}://{userinfo}{payload.proxyHost}:{payload.proxyPort}"
 
-    await crud.update_config_value(session, "proxy_url", proxy_url)
-    config_manager.invalidate("proxy_url")
+    await crud.update_config_value(session, "proxyUrl", proxy_url)
+    config_manager.invalidate("proxyUrl")
     
-    await crud.update_config_value(session, "proxy_enabled", str(payload.proxyEnabled).lower())
-    config_manager.invalidate("proxy_enabled")
+    await crud.update_config_value(session, "proxyEnabled", str(payload.proxyEnabled).lower())
+    config_manager.invalidate("proxyEnabled")
     logger.info(f"用户 '{current_user.username}' 更新了代理配置。")
 
 class ProxyTestRequest(BaseModel):
@@ -1425,7 +1548,13 @@ async def get_comments(
 
     comments_data = await crud.fetch_comments(session, episodeId)
     
-    comments = [models.Comment(cid=item["cid"], p=item["p"], m=item["m"]) for item in comments_data]
+    # 修正：使用 enumerate 为弹幕生成一个从0开始的自增ID (cid)。
+    # 弹幕文件本身不包含此ID，而API响应需要它，尤其对于前端（例如作为React的key）。
+    # 这也使其行为与 dandan_api 中的弹幕接口保持一致。
+    comments = [
+        models.Comment(cid=i, p=item.get("p", ""), m=item.get("m", ""))
+        for i, item in enumerate(comments_data)
+    ]
     return models.CommentResponse(count=len(comments), comments=comments)
 
 @router.get("/webhooks/available", response_model=List[str], summary="获取所有可用的Webhook类型")
@@ -1754,18 +1883,10 @@ async def incremental_refresh_task(sourceId: int, nextEpisodeIndex: int, session
         logger.error(f"增量刷新源任务 (ID: {sourceId}) 失败: {e}", exc_info=True)
         raise
 
-class ManualImportRequest(models.BaseModel):
-    title: str
-    episode_index: int = Field(..., alias="episodeIndex")
-    url: str
-
-    class Config:
-        populate_by_name = True
-
 @router.post("/library/source/{source_id}/manual-import", status_code=status.HTTP_202_ACCEPTED, summary="手动导入单个分集弹幕")
 async def manual_import_episode(
     source_id: int,
-    request_data: ManualImportRequest,
+    request_data: models.ManualImportRequest,
     current_user: models.User = Depends(security.get_current_user),
     session: AsyncSession = Depends(get_db_session),
     scraper_manager: ScraperManager = Depends(get_scraper_manager),
@@ -1779,22 +1900,66 @@ async def manual_import_episode(
 
     provider_name = source_info['providerName']
     
-    url_prefixes = {
-        'bilibili': 'bilibili.com', 'tencent': 'v.qq.com', 'iqiyi': 'iqiyi.com',
-        'youku': 'youku.com', 'mgtv': 'mgtv.com', 'acfun': 'acfun.cn', 'renren': 'rrsp.com.cn'
-    }
-    expected_prefix = url_prefixes.get(provider_name)
-    if not expected_prefix or expected_prefix not in request_data.url:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"提供的URL与当前源 '{provider_name}' 不匹配。")
+    # 修正：使用 url 或 content 字段，优先使用 content
+    content_to_use = request_data.content if request_data.content is not None else request_data.url
 
-    task_title = f"手动导入: {source_info['title']} - {request_data.title} - [{provider_name}]"
+    # 仅对非自定义源验证URL
+    if provider_name != 'custom':
+        if not content_to_use: # Should be caught by validator, but for safety
+             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="URL is required for non-custom sources.")
+        url_prefixes = {
+            'bilibili': 'bilibili.com', 'tencent': 'v.qq.com', 'iqiyi': 'iqiyi.com', 'youku': 'youku.com',
+            'mgtv': 'mgtv.com', 'acfun': 'acfun.cn', 'renren': 'rrsp.com.cn'
+        }
+        expected_prefix = url_prefixes.get(provider_name)
+        if not expected_prefix or expected_prefix not in content_to_use:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"提供的URL与当前源 '{provider_name}' 不匹配。")
+
+    task_title = f"手动导入: {source_info['title']} - {request_data.title or f'第 {request_data.episodeIndex} 集'} - [{provider_name}]"
     task_coro = lambda session, callback: tasks.manual_import_task(
-        sourceId=source_id, animeId=source_info['animeId'], title=request_data.title, episodeIndex=request_data.episode_index,
-        url=request_data.url, providerName=provider_name,
+        sourceId=source_id, animeId=source_info['animeId'], title=request_data.title,
+        episodeIndex=request_data.episodeIndex, content=content_to_use, providerName=provider_name,
         progress_callback=callback, session=session, manager=scraper_manager, rate_limiter=rate_limiter
     )
     task_id, _ = await task_manager.submit_task(task_coro, task_title)
     return {"message": f"手动导入任务 '{task_title}' 已提交。", "taskId": task_id}
+
+@router.post("/library/source/{sourceId}/batch-import", status_code=status.HTTP_202_ACCEPTED, summary="批量手动导入分集", response_model=UITaskResponse)
+async def batch_manual_import(
+    sourceId: int,
+    payload: models.BatchManualImportRequest,
+    current_user: models.User = Depends(security.get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+    task_manager: TaskManager = Depends(get_task_manager),
+    scraper_manager: ScraperManager = Depends(get_scraper_manager),
+    rate_limiter: RateLimiter = Depends(get_rate_limiter),
+):
+    """
+    为指定的数据源批量手动导入分集。
+    - 对于普通数据源，请求体中的 'content' 应为视频URL。
+    - 对于 'custom' 数据源，'content' 应为dandanplay格式的XML弹幕文件内容。
+    """
+    source_info = await crud.get_anime_source_info(session, sourceId)
+    if not source_info:
+        raise HTTPException(status_code=404, detail="数据源未找到")
+
+    task_title = f"批量手动导入: {source_info['title']} ({source_info['providerName']})"
+    unique_key = f"batch-manual-import-{sourceId}"
+    try:
+        task_coro = lambda s, cb: tasks.batch_manual_import_task(
+            sourceId=sourceId,
+            animeId=source_info['animeId'],
+            providerName=source_info['providerName'],
+            items=payload.items,
+            progress_callback=cb,
+            session=s,
+            manager=scraper_manager,
+            rate_limiter=rate_limiter
+        )
+        task_id, _ = await task_manager.submit_task(task_coro, task_title, unique_key=unique_key)
+        return {"message": "批量手动导入任务已提交", "taskId": task_id}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 
 async def manual_import_task(
     source_id: int, title: str, episode_index: int, url: str, provider_name: str,
@@ -1963,21 +2128,6 @@ async def get_available_jobs(request: Request):
     jobs = scheduler_manager.get_available_jobs()
     logger.info(f"可用的任务类型: {jobs}")
     return jobs
-@router.get("/scheduled-tasks", response_model=List[models.ScheduledTaskInfo], summary="获取所有定时任务")
-async def get_all_scheduled_tasks(
-    session: AsyncSession = Depends(get_db_session),
-    current_user: models.User = Depends(security.get_current_user)
-):
-    """
-    获取所有已配置的定时任务列表。
-    此实现确保即使没有任务，也总是返回一个空的JSON数组 `[]`，而不是 `null` 或空白响应。
-    """
-    tasks = await crud.get_scheduled_tasks(session)
-    # 关键修复：确保在没有任务时返回一个空列表，而不是 None
-    return tasks or []
-
-
-# --- Scheduled Tasks API ---
 
 @router.get("/scheduled-tasks", response_model=List[models.ScheduledTaskInfo], summary="获取所有定时任务")
 async def get_scheduled_tasks(
@@ -2112,6 +2262,31 @@ async def run_scheduled_task_now(taskId: str, current_user: models.User = Depend
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
+class GlobalFilterSettings(BaseModel):
+    cn: str
+    eng: str
+
+@router.get("/settings/global-filter", response_model=GlobalFilterSettings, summary="获取全局标题过滤规则")
+async def get_global_filter_settings(
+    config: ConfigManager = Depends(get_config_manager),
+    current_user: models.User = Depends(security.get_current_user)
+):
+    """获取用于过滤搜索结果的全局中文和英文黑名单正则表达式。"""
+    cn_filter = await config.get("search_result_global_blacklist_cn", "")
+    eng_filter = await config.get("search_result_global_blacklist_eng", "")
+    return GlobalFilterSettings(cn=cn_filter, eng=eng_filter)
+
+@router.put("/settings/global-filter", summary="更新全局标题过滤规则")
+async def update_global_filter_settings(
+    payload: GlobalFilterSettings,
+    config: ConfigManager = Depends(get_config_manager),
+    current_user: models.User = Depends(security.get_current_user)
+):
+    """更新全局的中文和英文标题过滤黑名单。"""
+    await config.setValue("search_result_global_blacklist_cn", payload.cn)
+    await config.setValue("search_result_global_blacklist_eng", payload.eng)
+    return {"message": "全局过滤规则已更新。"}
+
 @auth_router.put("/users/me/password", status_code=status.HTTP_204_NO_CONTENT, summary="修改当前用户密码")
 async def change_current_user_password(
     password_data: models.PasswordChange,
@@ -2178,8 +2353,8 @@ async def get_rate_limit_status(
     global_state = states_map.get("__global__")
     seconds_until_reset = 0
     if global_state:
-        # crud.py 中已确保 lastResetTime 是 aware datetime
-        time_since_reset = datetime.now(timezone.utc) - global_state.lastResetTime
+        # 使用 get_now() 确保时区一致性
+        time_since_reset = get_now().replace(tzinfo=None) - global_state.lastResetTime
         seconds_until_reset = max(0, int(period_seconds - time_since_reset.total_seconds()))
 
     provider_items = []

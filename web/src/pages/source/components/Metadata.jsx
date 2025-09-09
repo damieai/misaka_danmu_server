@@ -18,6 +18,7 @@ import {
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { ContainerOutlined } from '@ant-design/icons'
+import { useMessage } from '../../../MessageContext'
 
 const SortableItem = ({ item, index, handleChangeStatus }) => {
   const {
@@ -75,9 +76,11 @@ const SortableItem = ({ item, index, handleChangeStatus }) => {
             <Tag color="red">未启用</Tag>
           )}
           {item.providerName !== 'tmdb' ? (
-            <div onClick={handleChangeStatus}>
-              <MyIcon icon="exchange" size={24} />
-            </div>
+            <Tooltip title="切换启用状态">
+              <div onClick={handleChangeStatus}>
+                <MyIcon icon="exchange" size={24} />
+              </div>
+            </Tooltip>
           ) : (
             <div className="w-6"></div>
           )}
@@ -92,6 +95,8 @@ export const Metadata = () => {
   const [list, setList] = useState([])
   const [activeItem, setActiveItem] = useState(null)
   const dragOverlayRef = useRef(null)
+
+  const messageApi = useMessage()
 
   const sensors = useSensors(
     useSensor(MouseSensor, {
@@ -150,7 +155,7 @@ export const Metadata = () => {
       console.log(updatedList, 'updatedList')
       setList(updatedList)
       setMetaData(updatedList)
-      message.success(
+      messageApi.success(
         `已更新排序，${movedItem.providerName} 移动到位置 ${overIndex + 1}`
       )
     }

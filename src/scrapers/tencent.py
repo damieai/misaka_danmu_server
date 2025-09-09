@@ -9,7 +9,7 @@ from urllib.parse import quote
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from collections import defaultdict
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from datetime import datetime
+from datetime import datetime, timezone
 from ..config_manager import ConfigManager
 from ..utils import parse_search_keyword
 from .base import BaseScraper, get_season_from_title
@@ -23,6 +23,7 @@ scraper_responses_logger = logging.getLogger("scraper_responses")
 class TencentCommentContentStyle(BaseModel):
     color: Optional[str] = None
     position: Optional[int] = None
+    gradient_colors: Optional[List[str]] = None
 
 class TencentEpisode(BaseModel):
     vid: str = Field(..., description="分集视频ID")
@@ -37,6 +38,18 @@ class TencentComment(BaseModel):
     content: str = Field(..., description="弹幕内容")
     # API 对普通弹幕返回空字符串 ""，对特殊弹幕返回对象。Union可以同时处理这两种情况。
     content_style: Union[TencentCommentContentStyle, str, None] = Field(None)
+
+    @field_validator("content_style", mode="before")
+    @classmethod
+    def _validate_content_style(cls, v: Any) -> Any:
+        """在Pydantic验证前，尝试将JSON字符串解析为字典。"""
+        if isinstance(v, str) and v.startswith('{') and v.endswith('}'):
+            try:
+                return json.loads(v)
+            except json.JSONDecodeError:
+                # 如果解析失败，则返回原始字符串，保持健壮性
+                return v
+        return v
 
 
 # --- 用于搜索API的新模型 ---
@@ -167,17 +180,21 @@ class TencentScraper(BaseScraper):
     provider_name = "tencent"
     handled_domains = ["v.qq.com"]
     referer = "https://v.qq.com/"
-
-    # 英文关键词，通常是独立的缩写或单词
-    _ENG_JUNK = r'NC|OP|ED|SP|OVA|OAD|CM|PV|MV|BDMenu|Menu|Bonus|Recap|Teaser|Trailer|Preview|CD|Disc|Scan|Sample|Logo|Info|EDPV|SongSpot|BDSpot'
-    # 中文关键词，基于用户提供的JS脚本，非常全面
-    _CN_JUNK = r'拍摄花絮|制作花絮|幕后花絮|未播花絮|独家花絮|花絮特辑|预告片|先导预告|终极预告|正式预告|官方预告|彩蛋片段|删减片段|未播片段|番外彩蛋|精彩片段|精彩看点|精彩回顾|精彩集锦|看点解析|看点预告|NG镜头|NG花絮|番外篇|番外特辑|制作特辑|拍摄特辑|幕后特辑|导演特辑|演员特辑|片尾曲|插曲|主题曲|背景音乐|OST|音乐MV|歌曲MV|前季回顾|剧情回顾|往期回顾|内容总结|剧情盘点|精选合集|剪辑合集|混剪视频|独家专访|演员访谈|导演访谈|主创访谈|媒体采访|发布会采访|抢先看|抢先版|试看版|短剧|vlog'
-
-    # 将英文和中文关键词组合成一个统一的、强大的过滤模式
-    _JUNK_TITLE_PATTERN = re.compile(
-        r'(\[|\【|\b)(' + _ENG_JUNK + r')(\d{1,2})?(\s|_ALL)?(\]|\】|\b)|(' + _CN_JUNK + r')',
-        re.IGNORECASE
-    )
+    # 基于JS参考实现，提供一个更通用和全面的分集黑名单。
+    # 使用 re.escape 来确保特殊字符被正确处理。
+    _PROVIDER_SPECIFIC_BLACKLIST_DEFAULT = r"|".join(re.escape(keyword) for keyword in [
+        "拍摄花絮", "制作花絮", "幕后花絮", "未播花絮", "独家花絮", "花絮特辑",
+        "预告片", "先导预告", "终极预告", "正式预告", "官方预告",
+        "彩蛋片段", "删减片段", "未播片段", "番外彩蛋",
+        "精彩片段", "精彩看点", "精彩回顾", "精彩集锦", "看点解析", "看点预告",
+        "NG镜头", "NG花絮", "番外篇", "番外特辑",
+        "制作特辑", "拍摄特辑", "幕后特辑", "导演特辑", "演员特辑",
+        "片尾曲", "插曲", "主题曲", "背景音乐", "OST", "音乐MV", "歌曲MV",
+        "前季回顾", "剧情回顾", "往期回顾", "内容总结", "剧情盘点", "精选合集", "剪辑合集", "混剪视频",
+        "独家专访", "演员访谈", "导演访谈", "主创访谈", "媒体采访", "发布会采访",
+        "抢先看", "抢先版", "试看版", "短剧", "vlog", "纯享", "加更", "reaction",
+        "精编", "会员版", "Plus", "独家版", "特别版", "短片", "合唱"
+    ])
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession], config_manager: ConfigManager):
         super().__init__(session_factory, config_manager)
@@ -205,10 +222,23 @@ class TencentScraper(BaseScraper):
 
         # httpx.AsyncClient 是 Python 中功能强大的异步HTTP客户端，等同于 C# 中的 HttpClient
         # 此处通过 cookies 参数传入字典，httpx 会自动将其格式化为正确的 Cookie 请求头，效果与C#代码一致
-        self.client = httpx.AsyncClient(headers=self.base_headers, cookies=self.cookies, timeout=20.0)
+        self.client: Optional[httpx.AsyncClient] = None
 
         # 新增：用于分集获取的API端点
         self.episodes_api_url = "https://pbaccess.video.qq.com/trpc.universal_backend_service.page_server_rpc.PageServer/GetPageData?video_appid=3000010&vversion_name=8.2.96&vversion_platform=2"
+
+    async def _ensure_client(self):
+        """Ensures the httpx client is initialized, with proxy support."""
+        if self.client is None:
+            # 修正：使用基类中的 _create_client 方法来创建客户端，以支持代理
+            self.client = await self._create_client(
+                headers=self.base_headers, cookies=self.cookies, timeout=20.0
+            )
+
+    async def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        await self._ensure_client()
+        assert self.client is not None
+        return await self.client.request(method, url, **kwargs)
 
     # Porting TITLE_MAPPING from JS
     _TITLE_MAPPING = {
@@ -227,7 +257,9 @@ class TencentScraper(BaseScraper):
 
     async def close(self):
         """关闭HTTP客户端"""
-        await self.client.aclose()
+        if self.client:
+            await self.client.aclose()
+            self.client = None
 
     def _filter_search_item(self, item: TencentSearchItem, keyword: str) -> Optional[models.ProviderSearchInfo]:
         """
@@ -239,7 +271,7 @@ class TencentScraper(BaseScraper):
             return None
 
         video_info = item.video_info
-        vid = item.doc.id
+        media_id = item.doc.id # 对于搜索结果，这个ID是cid
 
         # 关键修正：参考旧代码，过滤掉没有年份信息的条目。
         # 这通常是无效的或非正片内容（如“安利向”、“二创合集”等）。
@@ -252,13 +284,13 @@ class TencentScraper(BaseScraper):
         title = self._apply_title_mapping(title)
 
         # Basic validation
-        if not title or not vid:
-            self.logger.debug(f"跳过无效项目: title={title}, vid={vid}")
+        if not title or not media_id:
+            self.logger.debug(f"跳过无效项目: title={title}, media_id={media_id}")
             return None
 
         # Apply intelligent filtering based on keywords
-        if self._JUNK_TITLE_PATTERN.search(title):
-            self.logger.debug(f"跳过不相关内容 (Junk Pattern Filter): {title}")
+        if self._GLOBAL_SEARCH_JUNK_TITLE_PATTERN.search(title):
+            self.logger.debug(f"跳过不相关内容 (Global Junk Pattern Filter): {title}")
             return None
 
         # 内容类型过滤与映射
@@ -297,16 +329,19 @@ class TencentScraper(BaseScraper):
         year = str(video_info.year) if video_info.year else None
         cover_url = video_info.img_url
 
+        # 修正：如果内容是电影，则总集数应为1，而不是依赖API可能返回的0。
+        episode_count = 1 if internal_media_type == 'movie' else (video_info.subject_doc.video_num if video_info.subject_doc else None)
+
         # Build ProviderSearchInfo
         return models.ProviderSearchInfo(
             provider=self.provider_name,
-            mediaId=vid,
+            mediaId=media_id,
             title=title,
             type=internal_media_type, # 使用映射后的标准类型
             season=get_season_from_title(title),
             year=int(year) if year else None,
             imageUrl=cover_url,
-            episodeCount=video_info.subject_doc.video_num if video_info.subject_doc else None,
+            episodeCount=episode_count,
             currentEpisodeIndex=None # This is a quick search, detailed episode info is fetched later
         )
 
@@ -318,7 +353,7 @@ class TencentScraper(BaseScraper):
         results = []
         try:
             self.logger.info(f"Tencent (桌面API): 正在搜索 '{keyword}'...")
-            response = await self.client.post(url, json=payload)
+            response = await self._request("POST", url, json=payload)
             if await self._should_log_responses():
                 scraper_responses_logger.debug(f"Tencent Desktop Search Response (keyword='{keyword}'): {response.text}")
 
@@ -349,7 +384,7 @@ class TencentScraper(BaseScraper):
         results = []
         try:
             self.logger.info(f"Tencent (移动API): 正在搜索 '{keyword}'...")
-            response = await self.client.post(url, json=payload, headers=headers)
+            response = await self._request("POST", url, json=payload, headers=headers)
             if await self._should_log_responses():
                 scraper_responses_logger.debug(f"Tencent Mobile Search Response (keyword='{keyword}'): {response.text}")
 
@@ -382,9 +417,9 @@ class TencentScraper(BaseScraper):
         results = []
         try:
             self.logger.info(f"Tencent (MultiTerminal API): 正在搜索 '{keyword}'...")
-            # 使用独立的 httpx.AsyncClient 或更新现有客户端的 headers/cookies
-            # 为了隔离，这里创建一个新的临时客户端
-            async with httpx.AsyncClient(headers=headers, cookies=self.multiterminal_cookies, timeout=20.0) as client:
+            # 修正：为这个特殊的API调用也应用代理设置
+            proxy_to_use = await self._get_proxy_for_provider()
+            async with httpx.AsyncClient(headers=headers, cookies=self.multiterminal_cookies, timeout=20.0, proxy=proxy_to_use) as client:
                 response = await client.post(url, json=payload)
 
             if await self._should_log_responses():
@@ -487,7 +522,7 @@ class TencentScraper(BaseScraper):
         cid = cid_match.group(1)
         
         try:
-            response = await self.client.get(url)
+            response = await self._request("GET", url)
             response.raise_for_status()
             html_content = response.text
 
@@ -511,10 +546,113 @@ class TencentScraper(BaseScraper):
             self.logger.error(f"Tencent: 从URL '{url}' 提取信息失败: {e}", exc_info=True)
             return None
 
+    async def _get_movie_vid_from_api(self, cid: str) -> Optional[str]:
+        """对于电影，优先尝试使用API获取其vid，这比解析HTML更可靠。"""
+        self.logger.info(f"正在尝试使用API获取电影 (cid={cid}) 的 vid...")
+        payload = {
+            "page_params": {
+                "cid": cid,
+                "page_type": "detail_operation",
+                "page_id": "vsite_episode_list_search",
+                "id_type": "1",
+                "page_size": "10",  # 我们只需要一个，但请求几个以防万一
+                "lid": "",
+                "req_from": "web_vsite",
+                "page_context": f"cid={cid}&req_from=web_vsite",
+                "page_num": "0"
+            }
+        }
+        try:
+            response = await self._request("POST", self.episodes_api_url, json=payload)
+            response.raise_for_status()
+            result = TencentPageResult.model_validate(response.json())
+
+            if result.data and result.data.module_list_datas:
+                for module_list_data in result.data.module_list_datas:
+                    for module_data in module_list_data.module_datas:
+                        if module_data.item_data_lists:
+                            for item in module_data.item_data_lists.item_datas:
+                                # 找到第一个不是预告片的有效vid
+                                if item.item_params and item.item_params.vid and item.item_params.is_trailer != "1":
+                                    vid = item.item_params.vid
+                                    self.logger.info(f"通过API成功获取到电影 (cid={cid}) 的 vid: {vid}")
+                                    return vid
+        except Exception as e:
+            self.logger.error(f"通过API获取电影vid失败 (cid={cid}): {e}", exc_info=False)
+        
+        self.logger.warning(f"通过API未能获取到电影 (cid={cid}) 的 vid。")
+        return None
     async def get_episodes(self, media_id: str, target_episode_index: Optional[int] = None, db_media_type: Optional[str] = None) -> List[models.ProviderEpisodeInfo]:
         """
         获取分集列表，优先使用新的“分页卡片”策略。
         """
+        # 修正：为电影类型提供专门的处理逻辑。
+        # 电影通常只有一个分集（即正片本身），其 episodeId 需要是 vid，而传入的 media_id 是 cid。
+        if db_media_type == 'movie':
+            self.logger.info(f"检测到媒体类型为电影 (media_id={media_id})，将获取正片 vid。")
+            
+            # 优先尝试通过API获取，更稳定
+            final_episode_id = await self._get_movie_vid_from_api(media_id)
+
+            if not final_episode_id:
+                # 如果API失败，回退到HTML解析
+                self.logger.warning(f"API获取电影vid失败，回退到HTML页面解析 (cid={media_id})。")
+                try:
+                    cover_url = f"https://v.qq.com/x/cover/{media_id}.html"
+                    response = await self._request("GET", cover_url)
+                    response.raise_for_status()
+                    html_content = response.text
+
+                    vid = None
+                    # 1. 最优先尝试从 COVER_INFO 变量解析
+                    cover_info_match = re.search(r'var\s+COVER_INFO\s*=\s*({.*?});', html_content)
+                    if cover_info_match:
+                        try:
+                            cover_info_data = json.loads(cover_info_match.group(1))
+                            vid = cover_info_data.get("vid")
+                            if vid: self.logger.info("从 COVER_INFO 成功解析到电影的 vid。")
+                        except (json.JSONDecodeError, KeyError, TypeError):
+                            self.logger.warning("解析 COVER_INFO 失败，将尝试备用方法。")
+
+                    # 2. 备用方法：尝试从 __INITIAL_DATA__ 解析
+                    if not vid:
+                        initial_data_match = re.search(r'window\.__INITIAL_DATA__\s*=\s*({.*?});', html_content)
+                        if initial_data_match:
+                            try:
+                                initial_data = json.loads(initial_data_match.group(1))
+                                vid = initial_data.get("video_info", {}).get("vid")
+                                if vid: self.logger.info("从 __INITIAL_DATA__ 成功解析到电影的 vid。")
+                            except (json.JSONDecodeError, KeyError, TypeError):
+                                self.logger.warning("解析 __INITIAL_DATA__ 失败，将尝试备用方法。")
+                    
+                    if vid:
+                        self.logger.info(f"从页面成功解析到电影的 vid: {vid}")
+                        final_episode_id = vid
+
+                except Exception as e:
+                    self.logger.error(f"HTML解析电影 vid 时出错 (cid={media_id})，将回退使用 cid: {e}", exc_info=True)
+            
+            # 如果所有方法都失败，则回退使用cid
+            if not final_episode_id:
+                self.logger.warning(f"所有方法均无法解析电影的 vid，将回退使用 cid ({media_id}) 作为 vid。这可能导致弹幕获取失败。")
+                final_episode_id = media_id
+
+            # 改进：尝试获取电影的实际标题，而不是写死为“正片”
+            # 我们已经通过 _get_movie_vid_from_api 获取了所有可能的“正片”分集
+            # 这里我们直接使用第一个分集的标题作为电影标题
+            final_episode_title = "正片" # 默认标题
+            try:
+                episodes_list = await self._fetch_episodes_paginated(media_id, db_media_type)
+                if episodes_list:
+                    final_episode_title = episodes_list[0].title
+            except Exception as e:
+                self.logger.warning(f"为电影 (cid={media_id}) 获取分集标题失败，将使用默认标题'正片': {e}")
+
+            return [models.ProviderEpisodeInfo(
+                provider=self.provider_name, episodeId=final_episode_id, title=final_episode_title, episodeIndex=1,
+                url=f"https://v.qq.com/x/cover/{media_id}/{final_episode_id}.html"
+            )]
+
         episodes = []
         try:
             # 优先尝试新的“分页卡片”策略
@@ -529,7 +667,7 @@ class TencentScraper(BaseScraper):
         if not episodes:
             # 方案2 (备): 回退到旧的分页逻辑
             self.logger.warning("Tencent: 新版API失败，正在回退到旧版分页API获取分集...")
-            episodes = await self._get_episodes_v1(media_id, db_media_type)
+            episodes = await self._get_episodes_v1(media_id)
 
         if target_episode_index:
             return [ep for ep in episodes if ep.episodeIndex == target_episode_index]
@@ -559,7 +697,7 @@ class TencentScraper(BaseScraper):
                 "detail_page_type": "1"
             }
         }
-        response = await self.client.post(self.episodes_api_url, json=payload)
+        response = await self._request("POST", self.episodes_api_url, json=payload)
         response.raise_for_status()
         result = TencentPageResult.model_validate(response.json())
 
@@ -568,7 +706,10 @@ class TencentScraper(BaseScraper):
             if module_data.module_datas and module_data.module_datas[0].module_params:
                 tabs_str = module_data.module_datas[0].module_params.tabs
                 if tabs_str:
-                    return [TencentEpisodeTabInfo.model_validate(t) for t in json.loads(tabs_str)]
+                    try:
+                        return [TencentEpisodeTabInfo.model_validate(t) for t in json.loads(tabs_str)]
+                    except json.JSONDecodeError:
+                        self.logger.error(f"Tencent: 解析分集卡片JSON失败: {tabs_str}")
         return None
 
     async def _fetch_episodes_by_tab(self, cid: str, tab: TencentEpisodeTabInfo) -> List[TencentEpisode]:
@@ -615,90 +756,158 @@ class TencentScraper(BaseScraper):
         return await self._process_and_format_tencent_episodes(list(all_episodes.values()), db_media_type, cid)
 
     async def _fetch_episodes_paginated(self, cid: str, db_media_type: Optional[str]) -> List[models.ProviderEpisodeInfo]:
-        """备用策略：通用的分页获取逻辑。"""
+        """备用策略：通用的分页获取逻辑。参考了外部脚本的实现以提高健壮性。"""
         all_episodes: Dict[str, TencentEpisode] = {}
-        max_pages = 15 if db_media_type == 'tv_series' else 5
+        
+        # 根据内容类型设置最大页数限制
+        if db_media_type == 'tv_series':
+            # 动漫和电视剧都属于 tv_series
+            max_pages = 15 # 保持原有的较高值
+        else:
+            max_pages = 5 # 电影等其他类型
+        
         items_per_page = 30
+        no_new_data_count = 0
 
         for page_num in range(max_pages):
+            # 关键优化：使用参考脚本中更详细的 page_context
+            page_context_str = f"cid={cid}&detail_page_type=1&id_type=1&is_skp_style=false&lid=&mvl_strategy_id=&order=&req_from=web_vsite&req_from_second_type=detail_operation&req_type=0&should_apply_tab_in_player=false&should_apply_tab_in_sub_page=false&show_all_episode=false&tab_data_key=lid%3D%26cid%3D{cid}&un_strategy_id=ea35cb94195c48c091172a047da3e761"
+            
             payload = {
+                "has_cache": 1, # 参考脚本中包含此参数
                 "page_params": {
-                    "cid": cid, "page_type": "detail_operation", "page_id": "vsite_episode_list_search",
-                    "id_type": "1", "page_size": str(items_per_page), "lid": "", "req_from": "web_vsite",
-                    "page_context": f"cid={cid}&req_from=web_vsite", "page_num": str(page_num)
+                    "cid": cid,
+                    "page_type": "detail_operation",
+                    "page_id": "vsite_episode_list_search",
+                    "id_type": "1",
+                    "page_size": str(items_per_page),
+                    "lid": "",
+                    "req_from": "web_vsite",
+                    "page_context": page_context_str,
+                    "page_num": str(page_num),
+                    "detail_page_type": "1" # 参考脚本中包含此参数
                 }
             }
-            response = await self.client.post(self.episodes_api_url, json=payload)
-            response.raise_for_status()
-            result = TencentPageResult.model_validate(response.json())
+            try:
+                response = await self._request("POST", self.episodes_api_url, json=payload)
+                if await self._should_log_responses():
+                    scraper_responses_logger.debug(f"Tencent Paginated Episodes Response (cid={cid}, page={page_num}): {response.text}")
+                response.raise_for_status()
+                result = TencentPageResult.model_validate(response.json())
+            except Exception as e:
+                self.logger.error(f"Tencent: 获取分页分集时出错 (cid={cid}, page={page_num}): {e}", exc_info=True)
+                break # 网络或解析错误时，终止分页
 
             new_episodes_this_page = 0
             if result.data and result.data.module_list_datas:
-                module_data = result.data.module_list_datas[0]
-                if module_data.module_datas and module_data.module_datas[0].item_data_lists:
-                    for item in module_data.module_datas[0].item_data_lists.item_datas:
-                        if item.item_params and item.item_params.vid and item.item_params.vid not in all_episodes:
-                            all_episodes[item.item_params.vid] = TencentEpisode.model_validate(item.item_params.model_dump())
-                            new_episodes_this_page += 1
+                # 修正：更安全地遍历可能为空的列表
+                for module_list_data in result.data.module_list_datas:
+                    for module_data in module_list_data.module_datas:
+                        if module_data.item_data_lists:
+                            for item in module_data.item_data_lists.item_datas:
+                                if item.item_params and item.item_params.vid and item.item_params.vid not in all_episodes:
+                                    all_episodes[item.item_params.vid] = TencentEpisode.model_validate(item.item_params.model_dump())
+                                    new_episodes_this_page += 1
             
-            if new_episodes_this_page == 0 and page_num > 0:
-                break
+            self.logger.debug(f"Tencent: 分页获取 (cid={cid}, page={page_num})，新增 {new_episodes_this_page} 个分集。")
+
+            # 优化：使用更健壮的循环终止逻辑
+            if new_episodes_this_page == 0:
+                no_new_data_count += 1
+                if no_new_data_count >= 2:
+                    self.logger.info(f"Tencent: 连续 {no_new_data_count} 页未获取到新分集，终止分页 (cid={cid})。")
+                    break
+            else:
+                no_new_data_count = 0 # 重置计数器
+            
             await asyncio.sleep(0.3)
 
         return await self._process_and_format_tencent_episodes(list(all_episodes.values()), db_media_type, cid)
 
-    async def _get_episodes_v1(self, media_id: str, db_media_type: Optional[str] = None) -> List[models.ProviderEpisodeInfo]:
+    async def _get_episodes_v1(self, media_id: str) -> List[models.ProviderEpisodeInfo]:
         """旧版分集获取逻辑，作为备用方案。"""
         tencent_episodes = await self._internal_get_episodes_v1(media_id)
-        return await self._process_and_format_tencent_episodes(tencent_episodes, db_media_type, media_id)
+        return await self._process_and_format_tencent_episodes(tencent_episodes, None, media_id)
 
     async def _process_and_format_tencent_episodes(self, tencent_episodes: List[TencentEpisode], db_media_type: Optional[str], cid: str) -> List[models.ProviderEpisodeInfo]:
         """
         将原始腾讯分集列表处理并格式化为通用格式。
-        新增：过滤非正片内容，并为综艺和普通剧集应用不同的排序和重编号逻辑。
+        参考了JS实现，为综艺和普通剧集应用不同的、更精确的过滤和排序逻辑。
         """
-        # 1. 初步过滤
-        pre_filtered = []
-        for ep in tencent_episodes:
-            if ep.is_trailer == "1":
-                continue
-            title_to_check = ep.union_title or ep.title or ""
-            if self._JUNK_TITLE_PATTERN.search(title_to_check):
-                continue
-            pre_filtered.append(ep)
+        # 1. 初始过滤：移除明确标记为预告片的内容
+        pre_filtered = [ep for ep in tencent_episodes if ep.is_trailer != "1"]
 
         # 2. 判断是否为综艺节目
         is_variety_show = False
-        if db_media_type == 'tv_series' and any("期" in (ep.union_title or ep.title) for ep in pre_filtered if ep.union_title or ep.title):
-            is_variety_show = True
+        if db_media_type == 'tv_series':
+            # 如果标题中普遍包含“期”字，则认为是综艺
+            qi_count = sum(1 for ep in pre_filtered if "期" in (ep.union_title or ep.title or ""))
+            if pre_filtered and qi_count > len(pre_filtered) / 2:
+                is_variety_show = True
 
         # 3. 根据类型进行处理
         if is_variety_show:
             self.logger.info("检测到综艺节目，正在应用特殊排序和过滤规则...")
+            
+            # 检查是否存在 "第N期" 格式
+            has_qi_format = any(re.search(r'第\d+期', ep.union_title or ep.title or "") for ep in pre_filtered)
+            
             episode_infos = []
             for ep in pre_filtered:
-                title = ep.union_title or ep.title
-                qi_match = re.search(r'第(\d+)期', title)
-                if not qi_match: continue
+                title = ep.union_title or ep.title or ""
+                
+                if has_qi_format:
+                    qi_updown_match = re.search(r'第(\d+)期([上下])', title, re.IGNORECASE)
+                    if qi_updown_match:
+                        qi_num_str, part = qi_updown_match.groups()
+                        # 检查后缀
+                        qi_text = f"第{qi_num_str}期{part}"
+                        after_text = title[title.find(qi_text) + len(qi_text):]
+                        if not re.match(r'^(会员版|纯享版|特别版|独家版|Plus|\+|花絮|预告|彩蛋|抢先|精选|未播|回顾|特辑|幕后)', after_text, re.IGNORECASE):
+                            episode_infos.append({'ep': ep, 'qi_num': int(qi_num_str), 'part': part})
+                    else:
+                        qi_match = re.search(r'第(\d+)期', title)
+                        if qi_match:
+                            # 过滤掉带有多余后缀的"第N期"
+                            if not re.search(r'(会员版|纯享版|特别版|独家版|加更|Plus|\+|花絮|预告|彩蛋|抢先|精选|未播|回顾|特辑|幕后)', title, re.IGNORECASE):
+                                episode_infos.append({'ep': ep, 'qi_num': int(qi_match.group(1)), 'part': ''})
+                else:
+                    # 如果没有"第N期"格式，则保留所有非广告内容
+                    if "广告" not in title and "推广" not in title:
+                        episode_infos.append({'ep': ep, 'qi_num': 0, 'part': ''})
 
-                updown_match = re.search(r'第(\d+)期([上下])', title)
-                qi_num = int(qi_match.group(1))
-                part = updown_match.group(2) if updown_match else ''
-                episode_infos.append({'ep': ep, 'qi_num': qi_num, 'part': part})
-
-            def sort_key(e):
+            # 排序
+            def sort_key_variety(e: Dict) -> Tuple:
                 part_order = {'上': 1, '': 2, '下': 3}
+                # 如果没有期号，使用标题排序
+                if e['qi_num'] == 0:
+                    return (float('inf'), e['ep'].union_title or e['ep'].title or "")
                 return (e['qi_num'], part_order.get(e['part'], 99))
             
-            episode_infos.sort(key=sort_key)
+            episode_infos.sort(key=sort_key_variety)
             
-            # 重新编号并格式化
-            episodes_to_format = [info['ep'] for info in episode_infos]
+            # URL去重，选择最佳标题
+            url_to_episodes: Dict[str, List[Dict]] = defaultdict(list)
+            for info in episode_infos:
+                url = f"https://v.qq.com/x/cover/{cid}/{info['ep'].vid}.html" # type: ignore
+                url_to_episodes[url].append(info)
+
+            final_ep_infos = []
+            for url, infos in url_to_episodes.items():
+                if len(infos) == 1:
+                    final_ep_infos.append(infos[0]['ep']) # type: ignore
+                else:
+                    # 选择最佳标题：优先不带日期的
+                    no_date_infos = [info for info in infos if not re.search(r'\d{4}-\d{2}-\d{2}', info['ep'].union_title or info['ep'].title or "")] # type: ignore
+                    best_info = no_date_infos[0] if no_date_infos else infos[0]
+                    final_ep_infos.append(best_info['ep']) # type: ignore
+            
+            episodes_to_format = final_ep_infos
         else:
             # 普通电视剧/动漫处理
             def sort_key_regular(ep: TencentEpisode):
-                title = ep.union_title or ep.title
-                match = re.search(r'第(\d+)集', title)
+                title = ep.union_title or ep.title or ""
+                match = re.search(r'第(\d+)[集话]', title)
                 if match: return int(match.group(1))
                 match = re.match(r'(\d+)', title)
                 if match: return int(match.group(1))
@@ -706,20 +915,54 @@ class TencentScraper(BaseScraper):
 
             episodes_to_format = sorted(pre_filtered, key=sort_key_regular)
 
-        # 4. 应用自定义黑名单并最终格式化
-        final_episodes = []
-        custom_blacklist_pattern = await self.get_episode_blacklist_pattern()
-
-        for i, ep in enumerate(episodes_to_format):
-            display_title = ep.union_title or ep.title
-            if custom_blacklist_pattern and custom_blacklist_pattern.search(display_title):
-                continue
+        # 4. 应用自定义黑名单 (先过滤)。综艺节目已在上面做了更严格的过滤，这里主要对电视剧/动漫生效。
+        if not is_variety_show:
+            blacklist_pattern = await self.get_episode_blacklist_pattern()
+            if blacklist_pattern:
+                original_count = len(episodes_to_format)
             
+                temp_episodes = []
+                filtered_reasons = defaultdict(int)
+                for ep in episodes_to_format:
+                    title_to_check = ep.union_title or ep.title or ""
+                    
+                    # 修正：使用更可靠的启发式规则来识别正片。
+                    # 检查 `ep.title` (通常是纯数字) 是否为数字，或检查 `title_to_check` (完整标题) 是否包含 "第" 字。
+                    is_likely_main_episode = bool(re.fullmatch(r'\d+', ep.title.strip())) or '第' in title_to_check
+                    
+                    # 如果是正片，则无论如何都保留。
+                    if is_likely_main_episode:
+                        temp_episodes.append(ep)
+                        continue
+
+                    # 如果不是正片，则检查是否匹配黑名单。
+                    match = blacklist_pattern.search(title_to_check)
+                    if not match:
+                        temp_episodes.append(ep)
+                    else:
+                        filtered_reasons[match.group(0)] += 1
+                
+                filtered_count = original_count - len(temp_episodes)
+                if filtered_count > 0:
+                    reasons_str = ", ".join([f"'{k}'({v}次)" for k, v in filtered_reasons.items()])
+                    self.logger.info(f"Tencent: 根据黑名单规则 ({reasons_str}) 过滤掉了 {filtered_count} 个分集。")
+                else:
+                    self.logger.info(f"Tencent: 根据黑名单规则过滤掉了 0 个分集。")
+                episodes_to_format = temp_episodes
+
+        # 5. 最终格式化 (后编号)
+        final_episodes = []
+        for i, ep in enumerate(episodes_to_format):
+            display_title = ep.union_title or ep.title or ""
+            # 对纯数字标题进行重命名
+            if re.fullmatch(r'\d+', display_title.strip()):
+                display_title = f"第{display_title}集"
+                
             final_episodes.append(models.ProviderEpisodeInfo(
                 provider=self.provider_name,
                 episodeId=ep.vid,
                 title=display_title,
-                episodeIndex=i + 1, # 关键：使用连续索引
+                episodeIndex=i + 1, # 关键：使用过滤后列表的连续索引
                 url=f"https://v.qq.com/x/cover/{cid}/{ep.vid}.html"
             ))
 
@@ -734,7 +977,7 @@ class TencentScraper(BaseScraper):
         # 1. 获取弹幕分段索引
         index_url = f"https://dm.video.qq.com/barrage/base/{vid}"
         try:
-            response = await self.client.get(index_url)
+            response = await self._request("GET", index_url)
             if await self._should_log_responses():
                 scraper_responses_logger.debug(f"Tencent Danmaku Index Response (vid={vid}): {response.text}")
             response.raise_for_status()
@@ -769,7 +1012,7 @@ class TencentScraper(BaseScraper):
 
             segment_url = f"https://dm.video.qq.com/barrage/segment/{vid}/{segment_name}"
             try:
-                response = await self.client.get(segment_url)
+                response = await self._request("GET", segment_url)
                 if await self._should_log_responses():
                     scraper_responses_logger.debug(f"Tencent Danmaku Segment Response (vid={vid}, segment={segment_name}): status={response.status_code}")
                 response.raise_for_status()
@@ -823,7 +1066,7 @@ class TencentScraper(BaseScraper):
             
             try:
                 self.logger.debug(f"请求分集列表 (cid={cid}), PageContext='{page_context}'")
-                response = await self.client.post(url, json=payload)
+                response = await self._request("POST", url, json=payload)
                 response.raise_for_status()
                 data = response.json()
     
@@ -908,30 +1151,41 @@ class TencentScraper(BaseScraper):
                 elif c.content_style.position == 3:
                     mode = 4  # 底部
                 
-                if c.content_style.color:
+                # 确定颜色：优先使用渐变色中的第一个颜色，如果存在的话
+                target_color_hex = None
+                if c.content_style.gradient_colors and len(c.content_style.gradient_colors) > 0:
+                    target_color_hex = c.content_style.gradient_colors[0]
+                elif c.content_style.color:
+                    target_color_hex = c.content_style.color
+                
+                if target_color_hex:
                     try:
-                        # 修正：腾讯的颜色值是十进制字符串，直接转换为整数
-                        color = int(c.content_style.color)
+                        # 颜色值是十六进制字符串，需要转换为十进制整数
+                        color = int(target_color_hex.lstrip('#'), 16)
                     except (ValueError, TypeError):
                         pass # 转换失败则使用默认白色
             
             # 将字符串类型的 time_offset 转为浮点数秒
             timestamp = int(c.time_offset) / 1000.0
-            # 格式: 时间,模式,颜色,[来源]
-            p_string = f"{timestamp:.2f},{mode},{color},[{self.provider_name}]"
+            # 格式: 时间,模式,字体大小,颜色,[来源]
+            p_string = f"{timestamp:.2f},{mode},25,{color},[{self.provider_name}]"
             formatted_comments.append({"cid": c.id, "p": p_string, "m": c.content, "t": round(timestamp, 2)})
 
         return formatted_comments
 
     async def get_id_from_url(self, url: str) -> Optional[str]:
-        """从腾讯视频URL中提取 vid。"""
-        # 腾讯视频的URL格式多样，但通常vid是路径的最后一部分
-        match = re.search(r'/([a-zA-Z0-9]+)\.html', url)
+        """从腾讯视频URL中提取 media_id (cid 或 vid)，以实现基类的抽象方法。"""
+        # 使用一个正则表达式同时匹配 cover URL 的 cid 和普通视频页的 vid
+        # 模式1: /cover/cid/...  模式2: /vid.html
+        match = re.search(r'/cover/([^/]+?)(?:/|\.html|$)|/([a-zA-Z0-9]{11,})\.html', url)
         if match:
-            vid = match.group(1)
-            self.logger.info(f"Tencent: 从URL {url} 解析到 vid: {vid}")
-            return vid
-        self.logger.warning(f"Tencent: 无法从URL中解析出 vid: {url}")
+            # match.group(1) 对应 cid, match.group(2) 对应 vid
+            media_id = match.group(1) or match.group(2)
+            id_type = "cid" if match.group(1) else "vid"
+            self.logger.info(f"Tencent: 从URL {url} 解析到 {id_type}: {media_id}")
+            return media_id
+        
+        self.logger.warning(f"Tencent: 无法从URL中解析出有效的 media_id: {url}")
         return None
 
     def format_episode_id_for_comments(self, provider_episode_id: Any) -> str:

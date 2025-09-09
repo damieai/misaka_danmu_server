@@ -22,23 +22,48 @@ class GamerScraper(BaseScraper):
     provider_name = "gamer"
     handled_domains = ["ani.gamer.com.tw"]
     referer = "https://ani.gamer.com.tw/"
-
-    _EPISODE_BLACKLIST_PATTERN = re.compile(r"加更|走心|解忧|纯享", re.IGNORECASE)
     def __init__(self, session_factory: async_sessionmaker[AsyncSession], config_manager: ConfigManager):
         super().__init__(session_factory, config_manager)
         self.cc_s2t = OpenCC('s2twp')  # Simplified to Traditional Chinese with phrases
         self.cc_t2s = OpenCC('t2s') # Traditional to Simplified
-        self.client = httpx.AsyncClient(
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
-            timeout=20.0,
-            follow_redirects=True
-        )
+        self.client: Optional[httpx.AsyncClient] = None
+
+    async def _ensure_client(self):
+        """Ensures the httpx client is initialized, with proxy support."""
+        if self.client is None:
+            # 修正：使用基类中的 _create_client 方法来创建客户端，以支持代理
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+            self.client = await self._create_client(headers=headers, timeout=20.0, follow_redirects=True)
+
+    async def get_episode_blacklist_pattern(self) -> Optional[re.Pattern]:
+        """
+        获取并编译用于过滤分集的正则表达式。
+        此方法现在只使用数据库中配置的规则，如果规则为空，则不进行过滤。
+        """
+        # 1. 构造该源特定的配置键，确保与数据库键名一致
+        provider_blacklist_key = f"{self.provider_name}_episode_blacklist_regex"
+        
+        # 2. 从数据库动态获取用户自定义规则
+        custom_blacklist_str = await self.config_manager.get(provider_blacklist_key)
+
+        # 3. 仅当用户配置了非空的规则时才进行过滤
+        if custom_blacklist_str and custom_blacklist_str.strip():
+            self.logger.info(f"正在为 '{self.provider_name}' 使用数据库中的自定义分集黑名单。")
+            try:
+                return re.compile(custom_blacklist_str, re.IGNORECASE)
+            except re.error as e:
+                self.logger.error(f"编译 '{self.provider_name}' 的分集黑名单时出错: {e}。规则: '{custom_blacklist_str}'")
+        
+        # 4. 如果规则为空或未配置，则不进行过滤
+        return None
 
     async def _ensure_config(self):
         """
         实时从数据库加载并应用Cookie和User-Agent配置。
         此方法在每次请求前调用，以确保配置实时生效。
         """
+        await self._ensure_client()
+        assert self.client is not None
         cookie = await self.config_manager.get("gamerCookie", "")
         user_agent = await self.config_manager.get("gamerUserAgent", "")
 
@@ -56,6 +81,8 @@ class GamerScraper(BaseScraper):
     async def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
         """一个简单的请求包装器。"""
         await self._ensure_config()
+        # _ensure_config already calls _ensure_client
+        assert self.client is not None
         response = await self.client.request(method, url, **kwargs)
         if await self._should_log_responses():
             # 截断HTML以避免日志过长
@@ -63,7 +90,9 @@ class GamerScraper(BaseScraper):
         return response
 
     async def close(self):
-        await self.client.aclose()
+        if self.client:
+            await self.client.aclose()
+            self.client = None
 
     async def search(self, keyword: str, episode_info: Optional[Dict[str, Any]] = None) -> List[models.ProviderSearchInfo]:
         """
@@ -269,50 +298,44 @@ class GamerScraper(BaseScraper):
             response.raise_for_status()
             soup = BeautifulSoup(response.text, "lxml")
 
-            episodes = []
+            raw_episodes = []
             season_section = soup.find("section", class_="season")
             if season_section:
                 ep_links = season_section.find_all("a")
-                for i, link in enumerate(ep_links):
-                    href = link.get("href")
-                    sn_match = re.search(r"\?sn=(\d+)", href)
-                    if not sn_match: continue
-                    
-                    episodes.append(models.ProviderEpisodeInfo(
-                        provider=self.provider_name, episodeId=sn_match.group(1),
-                        title=self.cc_t2s.convert(link.text.strip()),
-                        episodeIndex=i + 1,
-                        url=f"https://ani.gamer.com.tw{href}"
-                    ))
+                for link in ep_links:
+                    raw_episodes.append({'link': link, 'title': link.text.strip()})
             else:
                 script_content = soup.find("script", string=re.compile("animefun.videoSn"))
                 if script_content:
                     sn_match = re.search(r"animefun.videoSn\s*=\s*(\d+);", script_content.string)
                     title_match = re.search(r"animefun.title\s*=\s*'([^']+)';", script_content.string)
                     if sn_match and title_match:
-                        ep_sn = sn_match.group(1)
-                        episodes.append(models.ProviderEpisodeInfo(
-                            provider=self.provider_name, episodeId=ep_sn,
-                            title=self.cc_t2s.convert(title_match.group(1)), episodeIndex=1,
-                            url=f"https://ani.gamer.com.tw/animeVideo.php?sn={ep_sn}"
-                        ))
+                        raw_episodes.append({'link': None, 'sn': sn_match.group(1), 'title': title_match.group(1)})
 
-            # 根据黑名单过滤分集
-            if self._EPISODE_BLACKLIST_PATTERN:
-                original_count = len(episodes)
-                episodes = [ep for ep in episodes if not self._EPISODE_BLACKLIST_PATTERN.search(ep.title)]
-                filtered_count = original_count - len(episodes)
-                if filtered_count > 0:
-                    self.logger.info(f"Gamer: 根据黑名单规则过滤掉了 {filtered_count} 个分集。")
-            
-            # Apply custom blacklist from config
+            # 统一过滤逻辑
             blacklist_pattern = await self.get_episode_blacklist_pattern()
+            filtered_raw_episodes = raw_episodes
             if blacklist_pattern:
-                original_count = len(episodes)
-                episodes = [ep for ep in episodes if not blacklist_pattern.search(ep.title)]
-                filtered_count = original_count - len(episodes)
-                if filtered_count > 0:
-                    self.logger.info(f"Gamer: 根据自定义黑名单规则过滤掉了 {filtered_count} 个分集。")
+                original_count = len(raw_episodes)
+                filtered_raw_episodes = [ep for ep in raw_episodes if not blacklist_pattern.search(ep['title'])]
+                self.logger.info(f"Gamer: 根据黑名单规则过滤掉了 {original_count - len(filtered_raw_episodes)} 个分集。")
+
+            # 过滤后再编号
+            episodes = []
+            for i, raw_ep in enumerate(filtered_raw_episodes):
+                if raw_ep.get('link'):
+                    href = raw_ep['link'].get("href")
+                    sn_match = re.search(r"\?sn=(\d+)", href)
+                    if not sn_match: continue
+                    episodes.append(models.ProviderEpisodeInfo(
+                        provider=self.provider_name, episodeId=sn_match.group(1), title=self.cc_t2s.convert(raw_ep['title']),
+                        episodeIndex=i + 1, url=f"https://ani.gamer.com.tw{href}"
+                    ))
+                else: # 单集视频
+                    episodes.append(models.ProviderEpisodeInfo(
+                        provider=self.provider_name, episodeId=raw_ep['sn'], title=self.cc_t2s.convert(raw_ep['title']),
+                        episodeIndex=1, url=f"https://ani.gamer.com.tw/animeVideo.php?sn={raw_ep['sn']}"
+                    ))
 
             if target_episode_index:
                 return [ep for ep in episodes if ep.episodeIndex == target_episode_index]
@@ -384,7 +407,8 @@ class GamerScraper(BaseScraper):
                     
                     color = int(hex_color.lstrip('#'), 16)
                     
-                    p_string = f"{time_sec:.2f},{mode},{color},[{self.provider_name}]"
+                    # 修正：直接在此处添加字体大小 '25'，确保数据源的正确性
+                    p_string = f"{time_sec:.2f},{mode},25,{color},[{self.provider_name}]"
                     
                     formatted_comments.append({
                         # 修正：使用 'sn' (弹幕流水号) 作为唯一的弹幕ID (cid)，而不是 'userid'，以避免同一用户发送多条弹幕时出现重复键错误。

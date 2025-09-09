@@ -21,10 +21,17 @@ import {
   Form,
   Empty,
   InputNumber,
+  Dropdown,
+  Space,
 } from 'antd'
 import { useAtom } from 'jotai'
 import { lastSearchResultAtom, searchLoadingAtom } from '../../../../store'
-import { CheckOutlined, CloseCircleOutlined } from '@ant-design/icons'
+import {
+  CheckOutlined,
+  CloseCircleOutlined,
+  CalendarOutlined,
+  CloudServerOutlined,
+} from '@ant-design/icons'
 import { DANDAN_TYPE_DESC_MAPPING, DANDAN_TYPE_MAPPING } from '../../../configs'
 import { useWatch } from 'antd/es/form/Form'
 
@@ -44,6 +51,8 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
+import { useModal } from '../../../ModalContext'
+import { useMessage } from '../../../MessageContext'
 
 const IMPORT_MODE = [
   {
@@ -69,6 +78,9 @@ export const SearchResult = () => {
 
   const [selectList, setSelectList] = useState([])
 
+  const modalApi = useModal()
+  const messageApi = useMessage()
+
   /** 编辑导入相关 */
   const [editImportOpen, setEditImportOpen] = useState(false)
   const [editEpisodeList, setEditEpisodeList] = useState([])
@@ -79,6 +91,7 @@ export const SearchResult = () => {
   const dragOverlayRef = useRef(null)
   const [editConfirmLoading, setEditConfirmLoading] = useState(false)
   const [range, setRange] = useState([1, 1])
+  const [episodePageSize, setEpisodePageSize] = useState(10)
 
   const sensors = useSensors(
     useSensor(MouseSensor, {
@@ -110,12 +123,26 @@ export const SearchResult = () => {
     DANDAN_TYPE_MAPPING.tvseries,
   ])
 
+  const [yearFilter, setYearFilter] = useState('all')
+  const [providerFilter, setProviderFilter] = useState('all')
+
   const [keyword, setKeyword] = useState('')
 
   /** 渲染使用的数据 */
   const [renderData, setRenderData] = useState(
     lastSearchResultData.results || []
   )
+
+  useEffect(() => {
+    setSelectList([])
+  }, [renderData])
+
+  useEffect(() => {
+    if (searchLoading) {
+      setYearFilter('all')
+      setProviderFilter('all')
+    }
+  }, [searchLoading])
 
   const importModeText = useMemo(() => {
     const uniqueTitles = new Set(selectList.map(item => item.title))
@@ -136,18 +163,31 @@ export const SearchResult = () => {
   }, [selectList])
 
   useEffect(() => {
-    const list = lastSearchResultData.results
-      ?.filter(it => it.title.includes(keyword))
-      ?.filter(it => checkedList.includes(it.type))
-    console.log(
-      keyword,
-      checkedList,
-      lastSearchResultData.results,
-      list,
-      'list'
-    )
+    const list =
+      lastSearchResultData.results
+        ?.filter(it => it.title.includes(keyword))
+        ?.filter(it => checkedList.includes(it.type))
+        ?.filter(it => yearFilter === 'all' || it.year === yearFilter)
+        ?.filter(
+          it => providerFilter === 'all' || it.provider === providerFilter
+        ) || []
     setRenderData(list)
-  }, [keyword, checkedList, lastSearchResultData])
+  }, [keyword, checkedList, lastSearchResultData, yearFilter, providerFilter])
+
+  const { years, providers } = useMemo(() => {
+    if (!lastSearchResultData.results?.length)
+      return { years: [], providers: [] }
+    const yearSet = new Set()
+    const providerSet = new Set()
+    lastSearchResultData.results.forEach(item => {
+      if (item.year) yearSet.add(item.year)
+      if (item.provider) providerSet.add(item.provider)
+    })
+    return {
+      years: Array.from(yearSet).sort((a, b) => b - a),
+      providers: Array.from(providerSet).sort(),
+    }
+  }, [lastSearchResultData.results])
 
   const onTypeChange = values => {
     console.log(values, 'values')
@@ -171,9 +211,9 @@ export const SearchResult = () => {
         doubanId: item.doubanId,
         currentEpisodeIndex: item.currentEpisodeIndex,
       })
-      message.success(res.data.message || '导入成功')
+      messageApi.success(res.data.message || '导入成功')
     } catch (error) {
-      message.error(`提交导入任务失败: ${error.detail || error}`)
+      messageApi.error(`提交导入任务失败: ${error.detail || error}`)
     } finally {
       setLoading(false)
     }
@@ -200,9 +240,9 @@ export const SearchResult = () => {
           episodes: editEpisodeList ?? [],
         })
       )
-      message.success(res.data?.message || '编辑导入任务已提交。')
+      messageApi.success(res.data?.message || '编辑导入任务已提交。')
     } catch (error) {
-      message.error(`提交导入任务失败: ${error.message}`)
+      messageApi.error(`提交导入任务失败: ${error.message}`)
     } finally {
       setEditConfirmLoading(false)
       setEditImportOpen(false)
@@ -216,14 +256,14 @@ export const SearchResult = () => {
     let tmdbparams = {}
     if (importMode === 'merge') {
       if (!title) {
-        message.error('最终导入名称不能为空。')
+        messageApi.error('最终导入名称不能为空。')
         return
       }
       tmdbparams = {
         tmdbId: `${tmdbid}`,
       }
     }
-    Modal.confirm({
+    modalApi.confirm({
       title: '批量导入',
       zIndex: 1002,
       content: (
@@ -256,7 +296,7 @@ export const SearchResult = () => {
               )
             })
           )
-          message.success('批量导入任务已提交，请在任务管理器中查看进度。')
+          messageApi.success('批量导入任务已提交，请在任务管理器中查看进度。')
           setSelectList([])
           setConfirmLoading(false)
           setBatchOpen(false)
@@ -284,10 +324,10 @@ export const SearchResult = () => {
         setTmdbResult(res?.data || [])
         setTmdbOpen(true)
       } else {
-        message.error('没有找到相关内容')
+        messageApi.error('没有找到相关内容')
       }
     } catch (error) {
-      message.error('TMDB搜索失败')
+      messageApi.error('TMDB搜索失败')
     } finally {
       setSearchTmdbLoading(false)
     }
@@ -329,6 +369,27 @@ export const SearchResult = () => {
     })
 
     setActiveItem(null)
+  }
+
+  // 年份筛选菜单
+  const yearMenu = {
+    items: [
+      { key: 'all', label: '所有年份' },
+      ...years.map(year => ({ key: year, label: `${year}年` })),
+    ],
+    onClick: ({ key }) => setYearFilter(key === 'all' ? 'all' : Number(key)),
+  }
+
+  // 来源筛选菜单
+  const providerMenu = {
+    items: [
+      { key: 'all', label: '所有来源' },
+      ...providers.map(p => ({
+        key: p,
+        label: p.charAt(0).toUpperCase() + p.slice(1),
+      })),
+    ],
+    onClick: ({ key }) => setProviderFilter(key),
   }
 
   // 处理拖拽开始
@@ -423,8 +484,8 @@ export const SearchResult = () => {
       <Card title="搜索结果" loading={searchLoading}>
         <div>
           <Row gutter={[12, 12]} className="mb-6">
-            <Col md={20} xs={24}>
-              <div className="flex items-center justify-start flex-wrap md:flex-nowrap gap-4">
+            <Col md={9} xs={24}>
+              <Space wrap align="center">
                 <Button
                   type="primary"
                   className="w-32"
@@ -440,26 +501,54 @@ export const SearchResult = () => {
                     : '全选'}
                 </Button>
                 <Checkbox.Group
+                  className="shrink-0"
                   options={[
                     {
-                      label: '电影/剧场版',
+                      label: (
+                        <>
+                          <MyIcon icon="movie" size={16} className="mr-1" />
+                          电影/剧场版
+                        </>
+                      ),
                       value: DANDAN_TYPE_MAPPING.movie,
                     },
                     {
-                      label: '电视节目',
+                      label: (
+                        <>
+                          <MyIcon icon="tv" size={16} className="mr-1" />
+                          电视节目
+                        </>
+                      ),
                       value: DANDAN_TYPE_MAPPING.tvseries,
                     },
                   ]}
                   value={checkedList}
                   onChange={onTypeChange}
                 />
-                <div className="w-40">
+              </Space>
+            </Col>
+            <Col md={11} xs={24}>
+              <Space wrap align="center">
+                <Dropdown menu={yearMenu} disabled={!years.length}>
+                  <Button icon={<CalendarOutlined />}>
+                    {yearFilter === 'all' ? '按年份' : `${yearFilter}年`}
+                  </Button>
+                </Dropdown>
+                <Dropdown menu={providerMenu} disabled={!providers.length}>
+                  <Button icon={<CloudServerOutlined />}>
+                    {providerFilter === 'all'
+                      ? '按来源'
+                      : providerFilter.charAt(0).toUpperCase() +
+                        providerFilter.slice(1)}
+                  </Button>
+                </Dropdown>
+                <div className="w-full">
                   <Input
                     placeholder="在结果中过滤标题"
                     onChange={e => setKeyword(e.target.value)}
                   />
                 </div>
-              </div>
+              </Space>
             </Col>
             <Col md={4} xs={24}>
               <Button
@@ -467,7 +556,7 @@ export const SearchResult = () => {
                 type="primary"
                 onClick={() => {
                   if (selectList.length === 0) {
-                    message.error('请选择要导入的媒体')
+                    messageApi.error('请选择要导入的媒体')
                     return
                   }
 
@@ -483,10 +572,10 @@ export const SearchResult = () => {
               itemLayout="vertical"
               size="large"
               dataSource={renderData}
-              renderItem={(item, index) => {
+              renderItem={item => {
                 const isActive = selectList.includes(item)
                 return (
-                  <List.Item key={index}>
+                  <List.Item key={`${item.mediaId}-${item.provider}`}>
                     <Row gutter={[12, 12]}>
                       <Col md={16} xs={24}>
                         <div
@@ -499,23 +588,36 @@ export const SearchResult = () => {
                             })
                           }
                         >
-                          <div className="shrink-0 mr-3 w-6 h-6 border-2 border-base-text rounded-full flex items-center justify-center">
-                            {isActive && (
-                              <CheckOutlined className="font-base font-bold" />
-                            )}
-                          </div>
-                          <img width={60} alt="logo" src={item.imageUrl} />
+                          <Checkbox checked={isActive} />
+                          <img
+                            width={60}
+                            alt="logo"
+                            src={item.imageUrl}
+                            className="ml-3 aspect-[3/4]"
+                          />
                           <div className="ml-4">
                             <div className="text-xl font-bold mb-3">
                               {item.title}
+                              {item.type === 'movie' ? (
+                                <MyIcon
+                                  icon="movie"
+                                  size={20}
+                                  className="ml-2"
+                                />
+                              ) : (
+                                <MyIcon icon="tv" size={20} className="ml-2" />
+                              )}
                             </div>
                             <div className="flex items-center flex-wrap gap-2">
-                              <Tag color="magenta">源：{item.provider}</Tag>
-                              <Tag color="red">
-                                类型：{DANDAN_TYPE_DESC_MAPPING[item.type]}
+                              <Tag color="magenta">
+                                源：{item.provider ?? '未知'}
                               </Tag>
-                              <Tag color="volcano">年份：{item.year}</Tag>
-                              <Tag color="orange">季度：{item.season}</Tag>
+                              <Tag color="volcano">
+                                年份：{item.year ?? '未知'}
+                              </Tag>
+                              <Tag color="orange">
+                                季度：{item.season ?? '未知'}
+                              </Tag>
                               <Tag color="gold">
                                 总集数：{item.episodeCount ?? 0}
                               </Tag>
@@ -560,7 +662,7 @@ export const SearchResult = () => {
                             handleImportDanmu(item)
                           }}
                         >
-                          导入弹幕
+                          直接导入
                         </Button>
                       </Col>
                     </Row>
@@ -592,15 +694,19 @@ export const SearchResult = () => {
                   key={index}
                   className="my-3 p-2 rounded-xl border-gray-300/45 border"
                 >
-                  <div className="text-xl font-bold mb-2">{item.title}</div>
+                  <div className="text-xl font-bold mb-2">
+                    {item.title}
+                    {item.type === 'movie' ? (
+                      <MyIcon icon="movie" size={20} className="ml-2" />
+                    ) : (
+                      <MyIcon icon="tv" size={20} className="ml-2" />
+                    )}
+                  </div>
                   <div className="flex items-center flex-wrap gap-2">
-                    <Tag color="magenta">源：{item.provider}</Tag>
-                    <Tag color="red">
-                      类型：{DANDAN_TYPE_DESC_MAPPING[item.type]}
-                    </Tag>
-                    <Tag color="volcano">年份：{item.year}</Tag>
-                    <Tag color="orange">季度：{item.season}</Tag>
-                    <Tag color="gold">总集数：{item.episodeCount}</Tag>
+                    <Tag color="magenta">源：{item.provider ?? '未知'}</Tag>
+                    <Tag color="volcano">年份：{item.year ?? '未知'}</Tag>
+                    <Tag color="orange">季度：{item.season ?? '未知'}</Tag>
+                    <Tag color="gold">总集数：{item.episodeCount ?? 0}</Tag>
                   </div>
                 </div>
               )
@@ -628,7 +734,7 @@ export const SearchResult = () => {
                 <Input.Search
                   placeholder="请输入最终导入名称"
                   allowClear
-                  enterButton="Search"
+                  enterButton="搜索"
                   loading={searchTmdbLoading}
                   onSearch={onTmdbSearch}
                 />
@@ -652,6 +758,8 @@ export const SearchResult = () => {
           dataSource={tmdbList}
           pagination={{
             pageSize: 4,
+            showSizeChanger: false,
+            hideOnSinglePage: true,
           }}
           renderItem={(item, index) => {
             return (
@@ -660,8 +768,15 @@ export const SearchResult = () => {
                   <div className="flex items-center justify-start">
                     <img width={60} alt="logo" src={item.imageUrl} />
                     <div className="ml-4">
-                      <div className="text-xl font-bold mb-3">{item.name}</div>
+                      <div className="text-xl font-bold mb-3">
+                        {item.title || item.name}
+                      </div>
                       <div>ID: {item.id}</div>
+                      {!!item.details && (
+                        <div className="text-sm mt-2 line-clamp-4">
+                          {item.details}
+                        </div>
+                      )}
                     </div>
                   </div>
                   <div>
@@ -716,7 +831,7 @@ export const SearchResult = () => {
                     season: editItem.season ?? 1,
                   })
                   if (!res.data?.length) {
-                    message.error(
+                    messageApi.error(
                       `在弹幕库中未找到作品 "${editAnimeTitle || editItem.title}" 或该作品没有任何分集。`
                     )
                     return
@@ -733,11 +848,11 @@ export const SearchResult = () => {
                     )
                   }, 0)
 
-                  message.success(
+                  messageApi.success(
                     `重整完成！根据库内记录，移除了 ${removedCount} 个已存在的分集。`
                   )
                 } catch (error) {
-                  message.error(`查询已存在分集失败: ${error.message}`)
+                  messageApi.error(`查询已存在分集失败: ${error.message}`)
                 }
               }}
             >
@@ -802,6 +917,14 @@ export const SearchResult = () => {
               <List
                 itemLayout="vertical"
                 size="large"
+                pagination={{
+                  pageSize: episodePageSize,
+                  onShowSizeChange: (_, size) => {
+                    setEpisodePageSize(size)
+                  },
+                  hideOnSinglePage: true,
+                  showLessItems: true,
+                }}
                 dataSource={editEpisodeList}
                 renderItem={(item, index) => (
                   <SortableItem

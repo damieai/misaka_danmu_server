@@ -207,10 +207,38 @@ class RenrenScraper(BaseScraper):
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession], config_manager: ConfigManager):
         super().__init__(session_factory, config_manager)
-        self.client = httpx.AsyncClient(timeout=20.0, follow_redirects=True)
+        self.client: Optional[httpx.AsyncClient] = None
         self._api_lock = asyncio.Lock()
         self._last_request_time = 0.0
         self._min_interval = 0.4
+
+    async def _ensure_client(self):
+        """Ensures the httpx client is initialized, with proxy support."""
+        if self.client is None:
+            # 修正：使用基类中的 _create_client 方法来创建客户端，以支持代理
+            self.client = await self._create_client(timeout=20.0, follow_redirects=True)
+
+    async def get_episode_blacklist_pattern(self) -> Optional[re.Pattern]:
+        """
+        获取并编译用于过滤分集的正则表达式。
+        此方法现在只使用数据库中配置的规则，如果规则为空，则不进行过滤。
+        """
+        # 1. 构造该源特定的配置键，确保与数据库键名一致
+        provider_blacklist_key = f"{self.provider_name}_episode_blacklist_regex"
+        
+        # 2. 从数据库动态获取用户自定义规则
+        custom_blacklist_str = await self.config_manager.get(provider_blacklist_key)
+
+        # 3. 仅当用户配置了非空的规则时才进行过滤
+        if custom_blacklist_str and custom_blacklist_str.strip():
+            self.logger.info(f"正在为 '{self.provider_name}' 使用数据库中的自定义分集黑名单。")
+            try:
+                return re.compile(custom_blacklist_str, re.IGNORECASE)
+            except re.error as e:
+                self.logger.error(f"编译 '{self.provider_name}' 的分集黑名单时出错: {e}。规则: '{custom_blacklist_str}'")
+        
+        # 4. 如果规则为空或未配置，则不进行过滤
+        return None
 
     def _generate_device_id(self) -> str:
         """Generate a fresh device/session id for each request.
@@ -221,10 +249,14 @@ class RenrenScraper(BaseScraper):
         return str(uuid.uuid4()).upper()
 
     async def close(self):
-        await self.client.aclose()
+        if self.client:
+            await self.client.aclose()
+            self.client = None
 
     async def _request(self, method: str, url: str, *, params: Optional[Dict[str, Any]] = None) -> httpx.Response:
         # This method is now a simple wrapper, the rate limiting and signing is handled in _perform_network_search
+        await self._ensure_client()
+        assert self.client is not None
         device_id = self._generate_device_id()
         headers = build_signed_headers(method=method, url=url, params=params or {}, device_id=device_id)
         resp = await self.client.request(method, url, params=params, headers=headers)
@@ -420,38 +452,31 @@ class RenrenScraper(BaseScraper):
         if not detail_env or not detail_env.data or not detail_env.data.episodeList:
             return []
 
-        # 构造分集
-        episodes: List[RrspEpisodeInfo] = []
-        for idx, ep in enumerate(detail_env.data.episodeList, start=1):
+        # 过滤
+        raw_episodes = []
+        for ep in detail_env.data.episodeList:
             sid = str(ep.get("sid", "").strip())
-            if not sid:
-                continue
-            #ep_title = str(ep.get("title") or detail_env.data.dramaInfo.title)    #佬说这里引起标题不对
-            ep_title = str(ep.get("title") or f"第{idx:02d}集")
-            episodes.append(RrspEpisodeInfo(sid=sid, order=idx, title=ep_title))
+            if sid:
+                raw_episodes.append(ep)
 
-        if target_episode_index:
-            episodes = [e for e in episodes if e.order == target_episode_index]
-
-        provider_eps = [
-            models.ProviderEpisodeInfo(
-                provider=self.provider_name,
-                episodeId=e.sid,  # 人人弹幕按 episode sid 获取
-                title=e.title,
-                episodeIndex=e.order,
-                url=None,
-            )
-            for e in episodes
-        ]
-
-        # Apply custom blacklist from config
+        # 统一过滤逻辑
         blacklist_pattern = await self.get_episode_blacklist_pattern()
         if blacklist_pattern:
-            original_count = len(provider_eps)
-            provider_eps = [ep for ep in provider_eps if not blacklist_pattern.search(ep.title)]
-            filtered_count = original_count - len(provider_eps)
-            if filtered_count > 0:
-                self.logger.info(f"Renren: 根据自定义黑名单规则过滤掉了 {filtered_count} 个分集。")
+            original_count = len(raw_episodes)
+            raw_episodes = [ep for ep in raw_episodes if not blacklist_pattern.search(str(ep.get("title", "")))]
+            self.logger.info(f"Renren: 根据黑名单规则过滤掉了 {original_count - len(raw_episodes)} 个分集。")
+
+        # 过滤后再编号
+        provider_eps = []
+        for i, ep in enumerate(raw_episodes):
+            ep_title = str(ep.get("title") or f"第{i+1:02d}集")
+            provider_eps.append(models.ProviderEpisodeInfo(
+                provider=self.provider_name,
+                episodeId=str(ep.get("sid")),
+                title=ep_title,
+                episodeIndex=i + 1,
+                url=None,
+            ))
 
         if target_episode_index is None and db_media_type is None and provider_eps:
             await self._set_to_cache(cache_key, [e.model_dump() for e in provider_eps], 'episodes_ttl_seconds', 1800)
@@ -546,7 +571,7 @@ class RenrenScraper(BaseScraper):
             timestamp = float(c["timestamp"]) if isinstance(c["timestamp"], (int, float)) else 0.0
             color = int(c["color"]) if isinstance(c["color"], int) else 16777215
             mode = int(c["mode"]) if isinstance(c["mode"], int) else 1
-            p_string = f"{timestamp:.2f},{mode},{color},[{self.provider_name}]"
+            p_string = f"{timestamp:.2f},{mode},25,{color},[{self.provider_name}]"
             out.append({
                 "cid": c["content_id"],
                 "p": p_string,

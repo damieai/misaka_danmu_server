@@ -6,9 +6,21 @@
 [![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/l429609201/misaka_danmu_server?color=blue&label=download&sort=semver)](https://github.com/l429609201/misaka_danmu_server/releases/latest)
 [![telegram](https://img.shields.io/static/v1?label=telegram&message=misaka_danmu_server&color=blue)](https://t.me/misaka_danmu_server)
 
+
+
 一个功能强大的自托管弹幕（Danmaku）聚合与管理服务，兼容 [dandanplay](https://api.dandanplay.net/swagger/index.html) API 规范。
 
 本项目旨在通过刮削主流视频网站的弹幕，为您自己的媒体库提供一个统一、私有的弹幕API。它自带一个现代化的Web界面，方便您管理弹幕库、搜索源、API令牌和系统设置。
+
+
+
+> [!IMPORTANT]
+> **按需使用，请勿滥用**
+> 本项目旨在作为个人媒体库的弹幕补充工具。所有弹幕数据均实时从第三方公开API或网站获取。请合理使用，避免对源站造成不必要的负担。过度频繁的请求可能会导致您的IP被目标网站屏蔽。
+
+> [!NOTE]
+> **网络与地区限制**
+> 推荐使用大陆IP使用本项目，如果您在海外地区部署或使用此项目，可能会因网络或地区版权限制导致无法访问这些视频源。建议海外用户配置代理或确保网络环境可以访问国内网站。
 
 ## ✨ 核心功能
 
@@ -64,12 +76,13 @@
 
 ### 步骤 1: 准备 `docker-compose.yaml`
 
-1.  在一个合适的目录（例如 `~/danmuku`）下，创建 `docker-compose.yaml` 文件。
+1.  在一个合适的目录（例如 `~/danmuku`）下，创建 `docker-compose.yaml` 文件和所需的文件夹 `config，db-data`。
 
 
     ```bash
     mkdir -p ~/danmuku
     cd ~/danmuku
+    mkdir db-data,config                 
     touch docker-compose.yaml
     ```
 
@@ -93,15 +106,15 @@ services:
       MYSQL_PASSWORD: "your_strong_user_password"                       #数据库密码
       TZ: "Asia/Shanghai"
     volumes:
-      - ./mysql-data:/var/lib/mysql
+      - ./db-data:/var/lib/mysql
     command:
       - '--character-set-server=utf8mb4'
       - '--collation-server=utf8mb4_unicode_ci'
       - '--expire_logs_days=3' # 自动清理超过3天的binlog日志
       - '--binlog_expire_logs_seconds=259200' # 兼容MariaDB的等效设置 (3天)
     healthcheck:
-      #!!! 重要：-u和-p后不能有空格, 且密码需要与 MYSQL_PASSWORD 保持一致 !!! 这里启动检查的密码也要改
-      test: ["CMD-SHELL", "mysql -udanmuapi -p'your_strong_root_password' -e \"SELECT 1\" danmuapi"]
+      # 使用mysqladmin ping命令进行健康检查，通过环境变量引用密码
+      test: ["CMD-SHELL", "mysqladmin ping -u$$MYSQL_USER -p$$MYSQL_PASSWORD"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -160,7 +173,7 @@ services:
       POSTGRES_DB: "danmuapi"                                          #数据库名称
       TZ: "Asia/Shanghai"
     volumes:
-      - ./postgres-data:/var/lib/postgresql/data
+      - ./db-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U danmuapi -d danmuapi"]
       interval: 5s
@@ -307,6 +320,17 @@ networks:
   10. 保存设置。
 
 现在，当有新的电影或剧集添加到您的 Emby/Jellyfin 媒体库时，本服务将自动收到通知，并创建一个后台任务来为其搜索和导入弹幕。
+
+## 🤖 Telegram Bot 集成
+
+[balge](https://github.com/balge) 开发了一个功能强大的 Telegram Bot，可以帮助您通过聊天界面管理您的弹幕服务器。（弹幕库版本要大于v2.0.4才可以使用）
+
+**项目地址**: [misaka-danmuku-bot](https://github.com/balge/misaka-danmuku-bot)
+
+通过此机器人，您可以：
+- 搜索和导入新的影视作品。
+- 管理媒体库、数据源和分集。
+- 查看和管理后台任务。
 
 
 ## 常见问题

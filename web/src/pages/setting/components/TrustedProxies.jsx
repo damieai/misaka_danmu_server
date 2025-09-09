@@ -1,9 +1,9 @@
-import { Button, Card, Form, Input, message } from 'antd'
+import { Button, Card, Form, Input } from 'antd'
 import { useEffect, useState } from 'react'
-import { getDoubanConfig, setDoubanConfig } from '../../../apis'
+import { getTrustedProxiesConfig, setTrustedProxiesConfig } from '../../../apis'
 import { useMessage } from '../../../MessageContext'
 
-export const Douban = () => {
+export const TrustedProxies = () => {
   const [loading, setLoading] = useState(true)
   const [form] = Form.useForm()
   const [isSaveLoading, setIsSaveLoading] = useState(false)
@@ -11,9 +11,9 @@ export const Douban = () => {
 
   useEffect(() => {
     setLoading(true)
-    getDoubanConfig()
+    getTrustedProxiesConfig()
       .then(res => {
-        form.setFieldsValue({ cookie: res.data?.value ?? '' })
+        form.setFieldsValue({ trustedProxies: res.data?.value ?? '' })
       })
       .finally(() => {
         setLoading(false)
@@ -24,8 +24,8 @@ export const Douban = () => {
     try {
       setIsSaveLoading(true)
       const values = await form.validateFields()
-      await setDoubanConfig({
-        value: values.cookie,
+      await setTrustedProxiesConfig({
+        value: values.trustedProxies || '',
       })
       setIsSaveLoading(false)
       messageApi.success('保存成功')
@@ -38,23 +38,16 @@ export const Douban = () => {
 
   return (
     <div className="my-6">
-      <Card loading={loading} title="豆瓣 Cookie 配置">
-        <div className="mb-4">
-          豆瓣搜索通常无需配置即可使用。如果遇到搜索失败或403错误，可以尝试在此处配置您的豆瓣账户Cookie以提高请求成功率。请从浏览器开发者工具中获取。
-        </div>
+      <Card loading={loading} title="受信任的反向代理">
+        <div className="mb-4">当请求来自这些IP时，将从 X-Forwarded-For 或 X-Real-IP 头中解析真实客户端IP。多个IP或CIDR网段请用英文逗号(,)分隔。</div>
         <Form
           form={form}
           layout="horizontal"
           onFinish={handleSave}
           className="px-6 pb-6"
         >
-          <Form.Item
-            name="cookie"
-            label="Cookie"
-            rules={[{ required: true, message: '请输入豆瓣 Cookie' }]}
-            className="mb-6"
-          >
-            <Input.TextArea rows={8} />
+          <Form.Item name="trustedProxies" label="IP或CIDR列表" className="mb-6">
+            <Input.TextArea rows={4} placeholder="例如: 127.0.0.1, 192.168.1.0/24, 10.0.0.1/32" />
           </Form.Item>
 
           <Form.Item>
