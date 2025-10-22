@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Tuple
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -60,6 +60,7 @@ class ProviderSearchInfo(BaseModel):
     imageUrl: Optional[str] = Field(None, description="封面图片URL")
     episodeCount: Optional[int] = Field(None, description="总集数")
     currentEpisodeIndex: Optional[int] = Field(None, description="如果搜索词指定了集数，则为当前集数")
+    url: Optional[str] = Field(None, description="平台播放页面URL")
 
 
 class ProviderSearchResponse(BaseModel):
@@ -103,6 +104,7 @@ class MetadataDetailsResponse(BaseModel):
     aliasesCn: List[str] = []
     imageUrl: Optional[str] = None
     details: Optional[str] = None
+    year: Optional[int] = None
 
 class AnimeCreate(BaseModel):
     """Model for creating a new anime entry manually."""
@@ -188,8 +190,6 @@ class ScraperSetting(BaseModel):
 class MetadataSourceSettingUpdate(BaseModel):
     providerName: str
     isAuxSearchEnabled: bool
-    useProxy: bool
-    isFailoverEnabled: bool
     displayOrder: int
 
 
@@ -233,6 +233,7 @@ class TaskInfo(BaseModel):
     progress: int
     description: str
     createdAt: datetime
+    isSystemTask: bool = False
 
 class PaginatedTasksResponse(BaseModel):
     """用于任务列表分页的响应模型"""
@@ -375,11 +376,11 @@ class MetadataSourceStatusResponse(BaseModel):
     status: str
     useProxy: bool
     isFailoverEnabled: bool
+    logRawResponses: bool = Field(False, alias="log_raw_responses")
 
 class ScraperSettingWithConfig(ScraperSetting):
-    configurableFields: Optional[Dict[str, str]] = None
+    configurableFields: Optional[Dict[str, Union[str, Tuple[str, str, str]]]] = None
     isLoggable: bool
-    isVerified: bool
 
 class ProxySettingsResponse(BaseModel):
     proxyProtocol: str
@@ -417,10 +418,13 @@ class ScheduledTaskInfo(ScheduledTaskCreate):
     taskId: str
     lastRunAt: Optional[datetime] = None
     nextRunAt: Optional[datetime] = None
+    isSystemTask: bool = False
 
 class AvailableJobInfo(BaseModel):
     jobType: str
     name: str
+    description: str = ""
+    isSystemTask: bool = False
 
 class ProxySettingsUpdate(BaseModel):
     proxyProtocol: str

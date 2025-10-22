@@ -160,6 +160,8 @@ class BilibiliScraper(BaseScraper):
     test_url = "https://api.bilibili.com"
     _PROVIDER_SPECIFIC_BLACKLIST_DEFAULT = r"^(.*?)(抢先(看|版)?|加更|花絮|预告|特辑|彩蛋|专访|幕后|直播|纯享|未播|衍生|番外|会员(专享)?|片花|精华|看点|速看|解读|reaction|影评|解说|吐槽|盘点)(.*?)$"
 
+    rate_limit_quota = -1
+
     # For WBI signing
     _WBI_MIXIN_KEY_CACHE: Dict[str, Any] = {"key": None, "timestamp": 0}
     _WBI_MIXIN_KEY_CACHE_TTL = 3600  # Cache for 1 hour
@@ -169,6 +171,16 @@ class BilibiliScraper(BaseScraper):
         61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11,
         36, 20, 34, 44, 52
     ]
+
+    def build_media_url(self, media_id: str) -> Optional[str]:
+        """构造B站播放页面URL"""
+        # media_id可能是ss{season_id}或bv{bvid}格式
+        if media_id.startswith('ss') or media_id.startswith('ep'):
+            return f"https://www.bilibili.com/bangumi/play/{media_id}"
+        else:
+            # 假设是bvid
+            return f"https://www.bilibili.com/video/{media_id}"
+
     def __init__(self, session_factory: async_sessionmaker[AsyncSession], config_manager: ConfigManager):
         super().__init__(session_factory, config_manager)
         self._api_lock = asyncio.Lock()
@@ -470,6 +482,9 @@ class BilibiliScraper(BaseScraper):
         if cached_results:
             self.logger.info(f"Bilibili: 从缓存中命中基础搜索结果 (title='{search_title}')")
             all_results = [models.ProviderSearchInfo.model_validate(r) for r in cached_results]
+            # 修复：为缓存结果设置正确的currentEpisodeIndex
+            for item in all_results:
+                item.currentEpisodeIndex = episode_info.get("episode") if episode_info else None
         else:
             self.logger.info(f"Bilibili: 缓存未命中，正在为标题 '{search_title}' 执行网络搜索...")
             all_results = await self._perform_network_search(search_title, episode_info)
@@ -550,7 +565,8 @@ class BilibiliScraper(BaseScraper):
                         provider=self.provider_name, mediaId=media_id, title=cleaned_title,
                         type=media_type, season=get_season_from_title(cleaned_title),
                         year=year, imageUrl=item.cover, episodeCount=episode_count,
-                        currentEpisodeIndex=episode_info.get("episode") if episode_info else None
+                        currentEpisodeIndex=episode_info.get("episode") if episode_info else None,
+                        url=self.build_media_url(media_id)
                     ))
             else:
                 self.logger.info(f"Bilibili: API for type '{search_type}' returned no results. (Code: {api_result.code}, Message: '{api_result.message}')")
@@ -593,7 +609,8 @@ class BilibiliScraper(BaseScraper):
             year=year,
             imageUrl=item.cover,
             episodeCount=item.ep_size,
-            currentEpisodeIndex=None # This is not available in this context
+            currentEpisodeIndex=None, # This is not available in this context
+            url=self.build_media_url(media_id)
         )
 
     async def get_info_from_url(self, url: str) -> Optional[models.ProviderSearchInfo]:

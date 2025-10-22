@@ -69,8 +69,34 @@ def setup_logging():
     以及一个用于API的内存双端队列。
     此函数应在应用启动时被调用一次。
     """
-    log_dir = Path("/app/config/logs")
-    log_dir.mkdir(parents=True, exist_ok=True)
+    def _is_docker_environment():
+        """检测是否在Docker容器中运行"""
+        import os
+        # 方法1: 检查 /.dockerenv 文件（Docker标准做法）
+        if Path("/.dockerenv").exists():
+            return True
+        # 方法2: 检查环境变量
+        if os.getenv("DOCKER_CONTAINER") == "true" or os.getenv("IN_DOCKER") == "true":
+            return True
+        # 方法3: 检查当前工作目录是否为 /app
+        if Path.cwd() == Path("/app"):
+            return True
+        return False
+
+    if _is_docker_environment():
+        log_dir = Path("/app/config/logs")
+    else:
+        log_dir = Path("config/logs")
+
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except (OSError, PermissionError) as e:
+        # 如果无法创建日志目录，使用当前目录
+        print(f"警告: 无法创建日志目录 {log_dir}: {e}，将使用当前目录")
+        log_dir = Path(".")
+        log_file = log_dir / "app.log"
+    else:
+        log_file = log_dir / "app.log"
     log_file = log_dir / "app.log"
 
     # 为控制台和文件日志定义详细的格式
@@ -139,6 +165,29 @@ def setup_logging():
     scraper_logger.addHandler(scraper_handler)
     logging.info("专用的搜索源响应日志已初始化，将输出到 %s", scraper_log_file)
 
+    # --- 新增：为元数据响应设置一个专用的日志记录器 ---
+    metadata_log_file = log_dir / "metadata_responses.log"
+
+    if metadata_log_file.exists():
+        try:
+            with open(metadata_log_file, 'w', encoding='utf-8') as f:
+                f.truncate(0)
+            logging.info(f"已清空旧的元数据响应日志: {metadata_log_file}")
+        except IOError as e:
+            logging.error(f"清空元数据响应日志失败: {e}")
+
+    metadata_logger = logging.getLogger("metadata_responses")
+    metadata_logger.setLevel(logging.DEBUG)
+    metadata_logger.propagate = False
+
+    metadata_handler = logging.handlers.RotatingFileHandler(
+        metadata_log_file, maxBytes=10*1024*1024, backupCount=3, encoding='utf-8'
+    )
+    metadata_handler.setFormatter(logging.Formatter(
+        '[%(asctime)s] - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+    metadata_logger.addHandler(metadata_handler)
+    logging.info("专用的元数据响应日志已初始化，将输出到 %s", metadata_log_file)
     # --- 新增：为 Webhook 原始请求设置一个专用的日志记录器 ---
     webhook_log_file = log_dir / "webhook_raw.log"
 

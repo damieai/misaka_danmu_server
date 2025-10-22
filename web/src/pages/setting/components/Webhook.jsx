@@ -1,13 +1,17 @@
 import {
   Button,
   Card,
+  Col,
+  Divider,
   Form,
   Input,
   InputNumber,
+  Row,
   Select,
   Space,
   Spin,
   Switch,
+  Tooltip,
 } from 'antd'
 import { useEffect, useState } from 'react'
 import {
@@ -17,7 +21,11 @@ import {
   getWebhookSettings,
   setWebhookSettings,
 } from '../../../apis'
-import { CopyOutlined, ReloadOutlined } from '@ant-design/icons'
+import {
+  CopyOutlined,
+  ReloadOutlined,
+  InfoCircleOutlined,
+} from '@ant-design/icons'
 import copy from 'copy-to-clipboard'
 import { useMessage } from '../../../MessageContext'
 
@@ -89,6 +97,7 @@ export const Webhook = () => {
         webhookFilterMode: values.webhookFilterMode ?? 'blacklist',
         webhookFilterRegex: values.webhookFilterRegex ?? '',
         webhookLogRawRequest: values.webhookLogRawRequest ?? false,
+        webhookFallbackEnabled: values.webhookFallbackEnabled ?? false,
       }
       await setWebhookSettings(payload)
       messageApi.success('保存成功')
@@ -106,11 +115,11 @@ export const Webhook = () => {
   return (
     <div className="my-6">
       <Card loading={isLoading} title="Webhook 配置">
-        <Spin spinning={isLoading}>
+        <div>
           <div className="mb-3">
             Webhook
-            用于接收来自外部服务的通知，以实现自动化导入。请将下方对应服务的
-            URL 填入其 Webhook 通知设置中。
+            用于接收来自外部服务的通知，以实现自动化导入。请将下方对应服务的 URL
+            填入其 Webhook 通知设置中。
           </div>
           <div className="mb-4">{`URL 格式为：http(s)://域名(ip):端口(port)/api/webhook/{服务名}?api_key={你的API Key}`}</div>
           <div className="flex items-center justify-start gap-3 mb-4">
@@ -126,39 +135,68 @@ export const Webhook = () => {
               </Space.Compact>
             </div>
           </div>
-        </Spin>
+        </div>
+        <Divider />
         <Form form={form} layout="vertical" onFinish={onSave}>
-          <Form.Item label="Webhook 控制">
-            <Space align="center" wrap>
-              <span>启用 Webhook</span>
-              <Form.Item name="webhookEnabled" valuePropName="checked" noStyle>
-                <Switch />
-              </Form.Item>
-              <span style={{ marginLeft: '16px' }}>启用延时导入</span>
-              <Form.Item
-                name="webhookDelayedImportEnabled"
-                valuePropName="checked"
-                noStyle
-              >
-                <Switch disabled={!webhookEnabled} />
-              </Form.Item>
-              <span style={{ marginLeft: '16px' }}>自定义延时时间 (小时)</span>
-              <Form.Item name="webhookDelayedImportHours" noStyle>
-                <InputNumber
-                  min={1}
-                  disabled={!webhookEnabled || !isDelayedImportEnabled}
-                />
-              </Form.Item>
-              <span style={{ marginLeft: '16px' }}>记录原始请求</span>
-              <Form.Item
-                name="webhookLogRawRequest"
-                valuePropName="checked"
-                noStyle
-              >
-                <Switch disabled={!webhookEnabled} />
-              </Form.Item>
-            </Space>
-            <div className="text-gray-400 text-xs mt-1">
+          <Form.Item
+            label={<div className="text-base font-medium">Webhook 控制</div>}
+          >
+            <Row gutter={[16, 12]} align={'stretch'}>
+              <Col md={5} xs={12}>
+                <div className="h-full flex items-center gap-2">
+                  <span>启用 Webhook</span>
+                  <Form.Item
+                    name="webhookEnabled"
+                    valuePropName="checked"
+                    noStyle
+                  >
+                    <Switch />
+                  </Form.Item>
+                </div>
+              </Col>
+              <Col md={5} xs={12}>
+                <div className="h-full flex items-center gap-2">
+                  <span>启用延时导入</span>
+                  <Tooltip
+                    title="延时导入需要配合定时任务功能使用。启用后，Webhook接收到的通知会先存储到数据库中，等待定时任务在指定时间后执行导入。这样可以避免媒体文件还未完全扫描完成就开始导入弹幕的问题。请确保在【任务管理-定时任务】中启用了Webhook任务处理。"
+                    placement="top"
+                  >
+                    <InfoCircleOutlined />
+                  </Tooltip>
+                  <Form.Item
+                    name="webhookDelayedImportEnabled"
+                    valuePropName="checked"
+                    noStyle
+                  >
+                    <Switch disabled={!webhookEnabled} />
+                  </Form.Item>
+                </div>
+              </Col>
+              <Col md={6} xs={12}>
+                <div className="h-full flex items-center gap-2">
+                  <span>自定义延时时间 (小时)</span>
+                  <Form.Item name="webhookDelayedImportHours" noStyle>
+                    <InputNumber
+                      min={1}
+                      disabled={!webhookEnabled || !isDelayedImportEnabled}
+                    />
+                  </Form.Item>
+                </div>
+              </Col>
+              <Col md={6} xs={12}>
+                <div className="h-full flex items-center gap-2">
+                  <span>记录原始请求</span>
+                  <Form.Item
+                    name="webhookLogRawRequest"
+                    valuePropName="checked"
+                    noStyle
+                  >
+                    <Switch disabled={!webhookEnabled} />
+                  </Form.Item>
+                </div>
+              </Col>
+            </Row>
+            <div className="text-gray-400 text-xs mt-2">
               全局启用或禁用Webhook，并可选择延时导入以等待媒体文件被完整扫描。
             </div>
           </Form.Item>
@@ -188,6 +226,33 @@ export const Webhook = () => {
 
           <Form.Item name="webhookCustomDomain" label="自定义域名 (可选)">
             <Input placeholder="例如：https://your.domain.com" />
+          </Form.Item>
+
+          <Form.Item
+            label={
+              <div className="flex items-center gap-2">
+                <span className="text-base font-medium">启用顺延机制</span>
+                <Tooltip
+                  title="当选中的源没有有效分集时（如只有预告片被过滤掉），自动尝试下一个候选源。关闭此选项时，将使用传统的单源选择模式。"
+                  placement="top"
+                >
+                  <InfoCircleOutlined />
+                </Tooltip>
+              </div>
+            }
+          >
+            <div className="flex items-center gap-2">
+              <Form.Item
+                name="webhookFallbackEnabled"
+                valuePropName="checked"
+                noStyle
+              >
+                <Switch disabled={!webhookEnabled} />
+              </Form.Item>
+              <span className="text-gray-400 text-sm">
+                启用后，当首选源无法提供有效分集时，会自动尝试其他候选源
+              </span>
+            </div>
           </Form.Item>
 
           {webhookEnabled &&

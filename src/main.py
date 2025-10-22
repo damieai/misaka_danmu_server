@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, JSON
 from fastapi.middleware.cors import CORSMiddleware  # 新增：处理跨域
 import json
 from .config_manager import ConfigManager
-from .database import init_db_tables, close_db_engine, create_initial_admin_user # type: ignore
+from .database import init_db_tables, close_db_engine, create_initial_admin_user
 from .api import api_router, control_router
 from .dandan_api import dandan_router
 from .task_manager import TaskManager
@@ -21,13 +21,54 @@ from .scraper_manager import ScraperManager
 from .webhook_manager import WebhookManager
 from .scheduler import SchedulerManager
 from .config import settings
-from . import crud, security
+from . import crud, security, orm_models  # 添加 orm_models 导入
 from .log_manager import setup_logging
 from .rate_limiter import RateLimiter
+from ._version import APP_VERSION
 
-print(f"当前环境: {settings.environment}") 
+print(f"当前环境: {settings.environment}")
 
 logger = logging.getLogger(__name__)
+
+def _is_docker_environment():
+    """检测是否在Docker容器中运行"""
+    import os
+    # 方法1: 检查 /.dockerenv 文件（Docker标准做法）
+    if Path("/.dockerenv").exists():
+        return True
+    # 方法2: 检查环境变量
+    if os.getenv("DOCKER_CONTAINER") == "true" or os.getenv("IN_DOCKER") == "true":
+        return True
+    # 方法3: 检查当前工作目录是否为 /app
+    if Path.cwd() == Path("/app"):
+        return True
+    return False
+
+def _ensure_required_directories():
+    """确保应用运行所需的目录存在"""
+    if _is_docker_environment():
+        required_dirs = [
+            Path("/app/config/image"),
+        ]
+    else:
+        required_dirs = [
+            Path("config/image"),
+        ]
+
+    for dir_path in required_dirs:
+        try:
+            dir_path.mkdir(parents=True, exist_ok=True)
+            logger.info(f"确保目录存在: {dir_path}")
+        except (OSError, PermissionError) as e:
+            logger.warning(f"无法创建目录 {dir_path}: {e}")
+
+def _get_default_danmaku_path_template():
+    """根据运行环境获取默认弹幕路径模板"""
+
+    if _is_docker_environment():
+        return '/app/config/danmaku/${animeId}/${episodeId}'
+    else:
+        return 'config/danmaku/${animeId}/${episodeId}'
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -38,6 +79,12 @@ async def lifespan(app: FastAPI):
     """
     # --- Startup Logic ---
     setup_logging()
+
+    # 新增：在日志系统初始化后立即打印版本号
+    logger.info(f"Misaka Danmaku API 版本 {APP_VERSION} 正在启动...")
+
+    # 创建必要的目录
+    _ensure_required_directories()
 
     # init_db_tables 现在处理数据库创建、引擎和会话工厂的创建
     await init_db_tables(app)
@@ -87,16 +134,26 @@ async def lifespan(app: FastAPI):
         'bangumiClientSecret': ('', '用于Bangumi OAuth的App Secret。'),
         'doubanCookie': ('', '用于访问豆瓣API的Cookie。'),
         # 弹幕源
-        'danmakuOutputLimitPerSource': ('-1', '单源弹幕输出总数限制。-1为无限制。'),
+        'danmakuOutputLimitPerSource': ('-1', '弹幕输出上限。-1为无限制。超出限制时按时间段均匀采样。'),
         'danmakuAggregationEnabled': ('true', '是否启用跨源弹幕聚合功能。'),
         'scraperVerificationEnabled': ('false', '是否启用搜索源签名验证。'),
         'bilibiliCookie': ('', '用于访问B站API的Cookie，特别是buvid3。'),
         'gamerCookie': ('', '用于访问巴哈姆特动画疯的Cookie。'),
+        'matchFallbackEnabled': ('false', '是否为匹配接口启用后备机制（自动搜索导入）。'),
+        'matchFallbackBlacklist': ('', '匹配后备黑名单，使用正则表达式过滤文件名，匹配的文件不会触发后备机制。'),
+        'searchFallbackEnabled': ('false', '是否为搜索接口启用后备搜索功能（全网搜索）。'),
+        # 弹幕文件路径配置
+        'customDanmakuPathEnabled': ('false', '是否启用自定义弹幕文件保存路径。'),
+        'customDanmakuPathTemplate': (_get_default_danmaku_path_template(), '自定义弹幕文件路径模板。支持变量：${title}, ${season}, ${episode}, ${year}, ${provider}, ${animeId}, ${episodeId}。.xml后缀会自动添加。'),
+        'iqiyiUseProtobuf': ('false', '（爱奇艺）是否使用新的Protobuf弹幕接口（实验性）。'),
         'gamerUserAgent': ('', '用于访问巴哈姆特动画疯的User-Agent。'),
         # 全局过滤
         'search_result_global_blacklist_cn': (r'特典|预告|广告|菜单|花絮|特辑|速看|资讯|彩蛋|直拍|直播回顾|片头|片尾|幕后|映像|番外篇|纪录片|访谈|番外|短片|加更|走心|解忧|纯享|解读|揭秘|赏析', '用于过滤搜索结果标题的全局中文黑名单(正则表达式)。'),
         'search_result_global_blacklist_eng': (r'NC|OP|ED|SP|OVA|OAD|CM|PV|MV|BDMenu|Menu|Bonus|Recap|Teaser|Trailer|Preview|CD|Disc|Scan|Sample|Logo|Info|EDPV|SongSpot|BDSpot', '用于过滤搜索结果标题的全局英文黑名单(正则表达式)。'),
         'mysqlBinlogRetentionDays': (3, '（仅MySQL）自动清理多少天前的二进制日志（binlog）。0为不清理。需要SUPER或BINLOG_ADMIN权限。'),
+        # 顺延机制配置
+        'webhookFallbackEnabled': ('false', '是否启用Webhook顺延机制。当选中的源没有有效分集时，自动尝试下一个源。'),
+        'externalApiFallbackEnabled': ('false', '是否启用外部控制API顺延机制。当选中的源没有有效分集时，自动尝试下一个源。'),
     }
     await app.state.config_manager.register_defaults(default_configs)
 
@@ -121,14 +178,34 @@ async def lifespan(app: FastAPI):
 
 
 
-    app.state.task_manager = TaskManager(session_factory)
+    app.state.task_manager = TaskManager(session_factory, app.state.config_manager)
+    
+    # 初始化识别词管理器
+    from .title_recognition import TitleRecognitionManager
+    app.state.title_recognition_manager = TitleRecognitionManager(session_factory)
+    
     app.state.webhook_manager = WebhookManager(
-        session_factory, app.state.task_manager, app.state.scraper_manager, app.state.rate_limiter, app.state.metadata_manager, app.state.config_manager
+        session_factory, app.state.task_manager, app.state.scraper_manager, app.state.rate_limiter, app.state.metadata_manager, app.state.config_manager, app.state.title_recognition_manager
     )
     app.state.task_manager.start()
     await create_initial_admin_user(app)
+    
+    # 新增：创建系统内置定时任务
+    async with session_factory() as session:
+        existing_task = await session.get(orm_models.ScheduledTask, "system_token_reset")
+        if not existing_task:
+            await crud.create_scheduled_task(
+                session, 
+                task_id="system_token_reset",
+                name="系统内置：Token每日重置",
+                job_type="tokenReset", 
+                cron="0 0 * * *",
+                is_enabled=True
+            )
+            logger.info("已创建系统内置定时任务：重置API Token每日调用次数")
+    
     app.state.cleanup_task = asyncio.create_task(cleanup_task(app))
-    app.state.scheduler_manager = SchedulerManager(session_factory, app.state.task_manager, app.state.scraper_manager, app.state.rate_limiter, app.state.metadata_manager)
+    app.state.scheduler_manager = SchedulerManager(session_factory, app.state.task_manager, app.state.scraper_manager, app.state.rate_limiter, app.state.metadata_manager, app.state.config_manager, app.state.title_recognition_manager)
     await app.state.scheduler_manager.start()
     
     # --- 前端服务 (生产环境) ---
@@ -298,8 +375,30 @@ app.include_router(dandan_router, prefix="/api/v1", tags=["DanDanPlay Compatible
 app.include_router(api_router, prefix="/api")
 
 # --- 新增：挂载 Swagger UI 的静态文件目录 ---
-# 修正：使用相对于工作目录 /app 的绝对路径，使其不再受 __file__ 路径影响
-STATIC_DIR = Path("/app/static/swagger-ui")
+def _is_docker_environment():
+    """检测是否在Docker容器中运行"""
+    import os
+    # 方法1: 检查 /.dockerenv 文件（Docker标准做法）
+    if Path("/.dockerenv").exists():
+        return True
+    # 方法2: 检查环境变量
+    if os.getenv("DOCKER_CONTAINER") == "true" or os.getenv("IN_DOCKER") == "true":
+        return True
+    # 方法3: 检查当前工作目录是否为 /app
+    if Path.cwd() == Path("/app"):
+        return True
+    return False
+
+def _get_static_dir():
+    """获取静态文件目录，根据运行环境自动调整"""
+    if _is_docker_environment():
+        # 容器环境
+        return Path("/app/static/swagger-ui")
+    else:
+        # 源码运行环境
+        return Path("static/swagger-ui")
+
+STATIC_DIR = _get_static_dir()
 app.mount("/static/swagger-ui", StaticFiles(directory=STATIC_DIR), name="swagger-ui-static")
 
 # 添加一个运行入口，以便直接从配置启动

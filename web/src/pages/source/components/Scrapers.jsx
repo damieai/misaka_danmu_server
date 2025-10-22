@@ -1,13 +1,16 @@
 import {
   Button,
   Card,
+  Col,
   Checkbox,
   Form,
   Input,
   List,
   message,
   Modal,
+  Row,
   Switch,
+  Space,
   Tag,
   Tooltip,
 } from 'antd'
@@ -39,6 +42,14 @@ import {
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 
+import {
+  CloudOutlined,
+  DesktopOutlined,
+  KeyOutlined,
+  LockOutlined,
+  QuestionCircleOutlined,
+} from '@ant-design/icons'
+
 import { QRCodeCanvas } from 'qrcode.react'
 import { useAtomValue } from 'jotai'
 import { isMobileAtom } from '../../../../store'
@@ -60,7 +71,7 @@ const SortableItem = ({
     transition,
     isDragging,
   } = useSortable({
-    id: item.id || `item-${index}`, // 使用item.id或索引作为唯一标识
+    id: item.providerName, // 使用 providerName 作为唯一ID
     data: {
       item,
       index,
@@ -69,24 +80,22 @@ const SortableItem = ({
 
   const isMobile = useAtomValue(isMobileAtom)
 
-  // 拖拽样式
+  // 只保留必要的样式，移除会阻止滚动的touchAction
   const style = {
     transform: CSS.Transform.toString(transform),
     transition,
     opacity: isDragging ? 0.5 : 1,
-    cursor: 'grab',
-    touchAction: 'none', // 关键：阻止浏览器默认触摸行为
-    userSelect: 'none', // 防止拖拽时选中文本
     ...(isDragging && { cursor: 'grabbing' }),
   }
 
   return (
-    <List.Item ref={setNodeRef} style={style} {...attributes}>
+    <List.Item ref={setNodeRef} style={style}>
       {/* 保留你原有的列表项渲染逻辑 */}
       <div className="w-full flex items-center justify-between">
         {/* 左侧添加拖拽手柄 */}
         <div className="flex items-center gap-2">
-          <div {...listeners} style={{ cursor: 'grab' }}>
+          {/* 将attributes移到拖拽图标容器上，确保只有拖拽图标可触发拖拽 */}
+          <div {...attributes} {...listeners} style={{ cursor: 'grab' }}>
             <MyIcon icon="drag" size={24} />
           </div>
           <div>{item.providerName}</div>
@@ -143,11 +152,13 @@ export const Scrapers = () => {
   const [biliQrcodeStatus, setBiliQrcodeStatus] = useState('')
   const [biliQrcodeLoading, setBiliQrcodeLoading] = useState(false)
   const [biliUserinfo, setBiliUserinfo] = useState({})
-  console.log(biliUserinfo, 'biliUserinfo')
   const [biliLoginOpen, setBiliLoginOpen] = useState(false)
   const [biliQrcodeChecked, setBiliQrcodeChecked] = useState(false)
   /** 扫码登录轮训 */
   const timer = useRef(0)
+  // dandanplay auth mode
+  const [dandanAuthMode, setDandanAuthMode] = useState('local') // 'local' or 'proxy'
+  const [showAppSecret, setShowAppSecret] = useState(false)
 
   const modalApi = useModal()
   const messageApi = useMessage()
@@ -192,12 +203,8 @@ export const Scrapers = () => {
     }
 
     // 找到原位置和新位置
-    const activeIndex = list.findIndex(
-      item => item.providerName === active.data.current.item.providerName
-    )
-    const overIndex = list.findIndex(
-      item => item.providerName === over.data.current.item.providerName
-    )
+    const activeIndex = list.findIndex(item => item.providerName === active.id)
+    const overIndex = list.findIndex(item => item.providerName === over.id)
 
     if (activeIndex !== -1 && overIndex !== -1) {
       // 1. 重新排列数组
@@ -212,7 +219,6 @@ export const Scrapers = () => {
       }))
 
       // 3. 更新状态
-      console.log(updatedList, 'updatedList')
       setList(updatedList)
       setScrapers(updatedList)
       messageApi.success(
@@ -227,9 +233,7 @@ export const Scrapers = () => {
   const handleDragStart = event => {
     const { active } = event
     // 找到当前拖拽的项
-    const item = list.find(
-      item => (item.id || `item-${list.indexOf(item)}`) === active.id
-    )
+    const item = list.find(item => item.providerName === active.id)
     setActiveItem(item)
   }
 
@@ -238,7 +242,7 @@ export const Scrapers = () => {
       if (it.providerName === item.providerName) {
         return {
           ...it,
-          isEnabled: Number(!it.isEnabled),
+          isEnabled: !it.isEnabled,
         }
       } else {
         return it
@@ -255,17 +259,34 @@ export const Scrapers = () => {
     setOpen(true)
     setSetname(item.providerName)
     const setNameCapitalize = `${item.providerName.charAt(0).toUpperCase()}${item.providerName.slice(1)}`
+
+    // 动态地为所有可配置字段设置表单初始值
+    const dynamicInitialValues = {}
+    if (item.configurableFields) {
+      for (const key of Object.keys(item.configurableFields)) {
+        const camelKey = key.replace(/_([a-z])/g, g => g[1].toUpperCase())
+        dynamicInitialValues[camelKey] = res.data?.[camelKey]
+      }
+    }
+
     form.setFieldsValue({
       [`scraper${setNameCapitalize}LogResponses`]:
         res.data?.[`scraper${setNameCapitalize}LogResponses`] ?? false,
       [`${item.providerName}EpisodeBlacklistRegex`]:
         res.data?.[`${item.providerName}EpisodeBlacklistRegex`] || '',
-      [`${item.providerName}Cookie`]:
-        res.data?.[`${item.providerName}Cookie`] ?? undefined,
-      [`${item.providerName}UserAgent`]:
-        res.data?.[`${item.providerName}UserAgent`] ?? undefined,
       useProxy: res.data?.useProxy ?? false,
+      ...dynamicInitialValues,
     })
+
+    // Dandanplay specific logic
+    if (item.providerName === 'dandanplay') {
+      // 如果配置了 App ID，则为本地模式，否则默认为代理模式
+      if (res.data?.dandanplayAppId) {
+        setDandanAuthMode('local')
+      } else {
+        setDandanAuthMode('proxy')
+      }
+    }
   }
 
   const handleSaveSingleScraper = async () => {
@@ -273,6 +294,20 @@ export const Scrapers = () => {
       setConfirmLoading(true)
       const values = await form.validateFields()
       const setNameCapitalize = `${setname.charAt(0).toUpperCase()}${setname.slice(1)}`
+
+      // 根据当前模式，清空另一种模式的配置
+      if (setname === 'dandanplay') {
+        if (dandanAuthMode === 'local') {
+          values.dandanplayProxyConfig = ''
+        } else {
+          values.dandanplayAppId = ''
+          values.dandanplayAppSecret = ''
+          values.dandanplayAppSecretAlt = ''
+          values.dandanplayApiBaseUrl = ''
+        }
+        // dandanplay 不使用全局代理，移除该字段
+        delete values.useProxy
+      }
 
       await setSingleScraper({
         ...values,
@@ -391,6 +426,90 @@ export const Scrapers = () => {
     )
   }
 
+  const renderDynamicFormItems = () => {
+    const currentScraper = list.find(it => it.providerName === setname)
+    if (!currentScraper || !currentScraper.configurableFields) {
+      return null
+    }
+
+    return Object.entries(currentScraper.configurableFields).map(
+      ([key, fieldInfo]) => {
+        // 兼容旧的字符串格式和新的元组格式
+        const [label, type, tooltip] =
+          typeof fieldInfo === 'string'
+            ? [fieldInfo, 'string', '']
+            : fieldInfo
+        const camelKey = key.replace(/_([a-z])/g, g => g[1].toUpperCase())
+
+        // 如果是 dandanplay，则跳过所有已在定制UI中处理的字段
+        if (setname === 'dandanplay') {
+          return null
+        }
+
+        // 跳过通用黑名单字段，因为它在下面有专门的渲染逻辑
+        if (key.endsWith('_episode_blacklist_regex')) {
+          return null
+        }
+
+        switch (type) {
+          case 'boolean':
+            return (
+              <Form.Item
+                key={camelKey}
+                name={camelKey}
+                label={label}
+                valuePropName="checked"
+                className="mb-4"
+                tooltip={tooltip}
+              >
+                <Switch />
+              </Form.Item>
+            )
+          case 'string':
+            // 为 gamer 的 cookie 提供更大的输入框
+            if (key === 'gamerCookie') {
+              return (
+                <Form.Item
+                  key={camelKey}
+                  name={camelKey}
+                  label={label}
+                  className="mb-4"
+                  tooltip={tooltip}
+                >
+                  <Input.TextArea rows={4} />
+                </Form.Item>
+              )
+            }
+            return (
+              <Form.Item
+                key={camelKey}
+                name={camelKey}
+                label={label}
+                className="mb-4"
+                tooltip={tooltip}
+              >
+                <Input />
+              </Form.Item>
+            )
+          case 'password':
+            return (
+              <Form.Item
+                key={camelKey}
+                name={camelKey}
+                label={label}
+                className="mb-4"
+                tooltip={tooltip}
+              >
+                <Input.Password />
+              </Form.Item>
+            )
+          default:
+            return null
+        }
+      }
+    )
+  }
+
   return (
     <div className="my-6">
       <Card loading={loading} title="弹幕搜索源">
@@ -402,7 +521,7 @@ export const Scrapers = () => {
         >
           <SortableContext
             strategy={verticalListSortingStrategy}
-            items={list.map((item, index) => item.id || `item-${index}`)}
+            items={list.map(item => item.providerName)}
           >
             <List
               itemLayout="vertical"
@@ -410,7 +529,7 @@ export const Scrapers = () => {
               dataSource={list}
               renderItem={(item, index) => (
                 <SortableItem
-                  key={item.id || index}
+                  key={item.providerName}
                   item={item}
                   index={index}
                   biliUserinfo={biliUserinfo}
@@ -433,36 +552,142 @@ export const Scrapers = () => {
         cancelText="取消"
         okText="确认"
         onCancel={() => setOpen(false)}
+        destroyOnClose // 确保每次打开时都重新渲染
+        forceRender // 确保表单项在Modal打开时就存在
       >
         <Form form={form} layout="vertical">
           <div className="mb-4">请为 {setname} 源填写以下配置信息。</div>
-          <Form.Item
-            name="useProxy"
-            label="使用代理"
-            valuePropName="checked"
-            className="mb-4"
-          >
-            <Switch />
-          </Form.Item>
-          {/* gamer ua cookie */}
-          {setname === 'gamer' && (
+          {setname !== 'dandanplay' && (
+            <Form.Item
+              name="useProxy"
+              label="使用代理"
+              valuePropName="checked"
+              className="mb-4"
+            >
+              <Switch />
+            </Form.Item>
+          )}
+
+          {/* dandanplay specific */}
+          {setname === 'dandanplay' && (
             <>
-              <Form.Item
-                name={`${setname}Cookie`}
-                label="Cookie"
-                className="mb-4"
-              >
-                <Input.TextArea />
+              <Form.Item label="认证方式" className="mb-6">
+                <Switch
+                  checkedChildren={
+                    <Space>
+                      <CloudOutlined />
+                      跨域代理
+                    </Space>
+                  }
+                  unCheckedChildren={
+                    <Space>
+                      <DesktopOutlined />
+                      本地功能
+                    </Space>
+                  }
+                  checked={dandanAuthMode === 'proxy'}
+                  onChange={checked =>
+                    setDandanAuthMode(checked ? 'proxy' : 'local')
+                  }
+                />
               </Form.Item>
-              <Form.Item
-                name={`${setname}UserAgent`}
-                label="User-Agent"
-                className="mb-4"
-              >
-                <Input />
-              </Form.Item>
+
+              {dandanAuthMode === 'local' && (
+                <>
+                  <Form.Item
+                    name="dandanplayAppId"
+                    label={
+                      <span>
+                        App ID{' '}
+                        <a
+                          href="https://www.dandanplay.com/dev"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          <QuestionCircleOutlined className="cursor-pointer text-gray-400" />
+                        </a>
+                      </span>
+                    }
+                    rules={[{ required: true, message: '请输入App ID' }]}
+                    className="mb-4"
+                  >
+                    <Input
+                      prefix={<KeyOutlined className="text-gray-400" />}
+                      placeholder="请输入App ID"
+                    />
+                  </Form.Item>
+
+                  <Form.Item
+                    name="dandanplayAppSecret"
+                    label="App Secret"
+                    rules={[{ required: true, message: '请输入App Secret' }]}
+                    className="mb-4"
+                  >
+                    <Input.Password
+                      prefix={<LockOutlined className="text-gray-400" />}
+                      placeholder="请输入App Secret"
+                    />
+                  </Form.Item>
+
+                  <Form.Item
+                    name="dandanplayAppSecretAlt"
+                    label="备用App Secret"
+                    tooltip="可选的备用密钥，用于轮换使用以避免频率限制"
+                    className="mb-4"
+                  >
+                    <Input.Password
+                      prefix={<LockOutlined className="text-gray-400" />}
+                      placeholder="请输入备用App Secret（可选）"
+                    />
+                  </Form.Item>
+
+                  <Form.Item
+                    name="dandanplayApiBaseUrl"
+                    label="API基础URL"
+                    tooltip="弹弹play API的基础URL，通常无需修改"
+                    className="mb-4"
+                  >
+                    <Input placeholder="默认为 https://api.dandanplay.net" />
+                  </Form.Item>
+                </>
+              )}
+
+              {dandanAuthMode === 'proxy' && (
+                <Form.Item
+                  name="dandanplayProxyConfig"
+                  label={
+                    <span>
+                      跨域代理配置{' '}
+                      <Tooltip title="JSON格式的代理配置，支持多个代理服务器">
+                        <QuestionCircleOutlined className="cursor-pointer text-gray-400" />
+                      </Tooltip>
+                    </span>
+                  }
+                  rules={[
+                    { required: true, message: '请输入代理配置' },
+                    {
+                      validator: (_, value) => {
+                        if (!value) return Promise.resolve()
+                        try {
+                          JSON.parse(value)
+                          return Promise.resolve()
+                        } catch {
+                          return Promise.reject(new Error('请输入有效的JSON格式'))
+                        }
+                      },
+                    },
+                  ]}
+                  className="mb-6"
+                >
+                  <Input.TextArea rows={8} />
+                </Form.Item>
+              )}
             </>
           )}
+
+          {/* 动态渲染表单项 */}
+          {renderDynamicFormItems()}
+
           {/* 通用部分 分集标题黑名单 记录原始响应 */}
           <Form.Item
             name={`${setname}EpisodeBlacklistRegex`}
@@ -471,7 +696,7 @@ export const Scrapers = () => {
           >
             <Input.TextArea rows={6} />
           </Form.Item>
-          <div className="flex items-center justify-start flex-wrap md:flex-nowrap gap-2 mb-4">
+          <div className="flex items-center justify-start flex-wrap gap-2 mb-4">
             <Form.Item
               name={`scraper${setname.charAt(0).toUpperCase()}${setname.slice(1)}LogResponses`}
               label="记录原始响应"

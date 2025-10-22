@@ -11,8 +11,6 @@ import {
   Card,
   Col,
   List,
-  message,
-  Checkbox,
   Row,
   Tag,
   Input,
@@ -23,16 +21,21 @@ import {
   InputNumber,
   Dropdown,
   Space,
+  Checkbox,
 } from 'antd'
 import { useAtom } from 'jotai'
-import { lastSearchResultAtom, searchLoadingAtom } from '../../../../store'
 import {
-  CheckOutlined,
+  isMobileAtom,
+  lastSearchResultAtom,
+  searchLoadingAtom,
+} from '../../../../store'
+import {
   CloseCircleOutlined,
   CalendarOutlined,
   CloudServerOutlined,
+  LinkOutlined,
 } from '@ant-design/icons'
-import { DANDAN_TYPE_DESC_MAPPING, DANDAN_TYPE_MAPPING } from '../../../configs'
+import { DANDAN_TYPE_MAPPING } from '../../../configs'
 import { useWatch } from 'antd/es/form/Form'
 
 import { MyIcon } from '@/components/MyIcon'
@@ -73,6 +76,8 @@ export const SearchResult = () => {
   const [searchTmdbLoading, setSearchTmdbLoading] = useState(false)
   const [tmdbOpen, setTmdbOpen] = useState(false)
 
+  const [isMobile] = useAtom(isMobileAtom)
+
   const [searchLoading] = useAtom(searchLoadingAtom)
   const [lastSearchResultData] = useAtom(lastSearchResultAtom)
 
@@ -92,6 +97,7 @@ export const SearchResult = () => {
   const [editConfirmLoading, setEditConfirmLoading] = useState(false)
   const [range, setRange] = useState([1, 1])
   const [episodePageSize, setEpisodePageSize] = useState(10)
+  const [episodeOrder, setEpisodeOrder] = useState('asc') // 新增：排序状态
 
   const sensors = useSensors(
     useSensor(MouseSensor, {
@@ -107,7 +113,9 @@ export const SearchResult = () => {
     })
   )
 
-  const searchSeason = lastSearchResultData?.season
+  const searchSeason = lastSearchResultData?.search_season
+  const searchEpisode = lastSearchResultData?.search_episode
+  const supplementalResults = lastSearchResultData?.supplemental_results || []
 
   const [loading, setLoading] = useState(false)
 
@@ -118,11 +126,7 @@ export const SearchResult = () => {
   const [importMode, setImportMode] = useState(IMPORT_MODE[0].key)
 
   /** 筛选条件 */
-  const [checkedList, setCheckedList] = useState([
-    DANDAN_TYPE_MAPPING.movie,
-    DANDAN_TYPE_MAPPING.tvseries,
-  ])
-
+  const [typeFilter, setTypeFilter] = useState('all')
   const [yearFilter, setYearFilter] = useState('all')
   const [providerFilter, setProviderFilter] = useState('all')
 
@@ -166,13 +170,13 @@ export const SearchResult = () => {
     const list =
       lastSearchResultData.results
         ?.filter(it => it.title.includes(keyword))
-        ?.filter(it => checkedList.includes(it.type))
+        ?.filter(it => typeFilter === 'all' || it.type === typeFilter)
         ?.filter(it => yearFilter === 'all' || it.year === yearFilter)
         ?.filter(
           it => providerFilter === 'all' || it.provider === providerFilter
         ) || []
     setRenderData(list)
-  }, [keyword, checkedList, lastSearchResultData, yearFilter, providerFilter])
+  }, [keyword, typeFilter, lastSearchResultData, yearFilter, providerFilter])
 
   const { years, providers } = useMemo(() => {
     if (!lastSearchResultData.results?.length)
@@ -188,11 +192,6 @@ export const SearchResult = () => {
       providers: Array.from(providerSet).sort(),
     }
   }, [lastSearchResultData.results])
-
-  const onTypeChange = values => {
-    console.log(values, 'values')
-    setCheckedList(values)
-  }
 
   const handleImportDanmu = async item => {
     try {
@@ -371,6 +370,40 @@ export const SearchResult = () => {
     setActiveItem(null)
   }
 
+  // 类型筛选菜单
+  const typeMenu = {
+    items: [
+      {
+        key: 'all',
+        label: (
+          <>
+            <MyIcon icon="tvlibrary" size={16} className="mr-2" />
+            所有类型
+          </>
+        ),
+      },
+      {
+        key: DANDAN_TYPE_MAPPING.movie,
+        label: (
+          <>
+            <MyIcon icon="movie" size={16} className="mr-2" />
+            电影/剧场版
+          </>
+        ),
+      },
+      {
+        key: DANDAN_TYPE_MAPPING.tvseries,
+        label: (
+          <>
+            <MyIcon icon="tv" size={16} className="mr-2" />
+            电视节目
+          </>
+        ),
+      },
+    ],
+    onClick: ({ key }) => setTypeFilter(key),
+  }
+
   // 年份筛选菜单
   const yearMenu = {
     items: [
@@ -479,12 +512,78 @@ export const SearchResult = () => {
     )
   }
 
+  // 新增：切换排序的处理函数
+  const handleToggleOrder = () => {
+    const newOrder = episodeOrder === 'asc' ? 'desc' : 'asc'
+    setEpisodeOrder(newOrder)
+
+    setEditEpisodeList(list => {
+      const sortedList = [...list].sort((a, b) => {
+        if (newOrder === 'asc') {
+          return a.episodeIndex - b.episodeIndex
+        } else {
+          return b.episodeIndex - a.episodeIndex
+        }
+      })
+      return sortedList
+    })
+  }
+
+  // 补充搜索
+  const supplementDom = item => {
+    if (item.episodeCount === 0) {
+      const calculateSimilarity = (str1, str2) => {
+        if (!str1 || !str2) return 0
+        const s1 = str1.toLowerCase().trim()
+        const s2 = str2.toLowerCase().trim()
+        if (s1 === s2) return 100
+        if (s1.includes(s2) || s2.includes(s1)) return 85
+        // 简单的词汇匹配
+        const words1 = s1.split(/\s+/)
+        const words2 = s2.split(/\s+/)
+        const commonWords = words1.filter(word => words2.includes(word))
+        return (
+          (commonWords.length / Math.max(words1.length, words2.length)) * 100
+        )
+      }
+
+      const best_supplement = supplementalResults.find(
+        sup =>
+          sup.provider !== item.provider &&
+          calculateSimilarity(item.title, sup.title) > 80
+      )
+
+      if (best_supplement) {
+        return (
+          <div className="mt-2 p-2 bg-gray-100 dark:bg-gray-700 rounded-md flex items-center gap-2 flex-wrap justify-start">
+            <Tag color="purple">{best_supplement.provider}</Tag>
+            <span className="text-sm text-gray-500 dark:text-gray-400 shrink-0">
+              找到补充源: {best_supplement.title}
+            </span>
+            <Button
+              size="small"
+              type="link"
+              onClick={e => {
+                e.stopPropagation() // 防止触发外层的选择事件
+                handleImportDanmu(best_supplement)
+              }}
+            >
+              使用此源导入
+            </Button>
+          </div>
+        )
+      }
+      return null
+    }
+    return null
+  }
+
   return (
     <div className="my-4">
       <Card title="搜索结果" loading={searchLoading}>
         <div>
           <Row gutter={[12, 12]} className="mb-6">
-            <Col md={9} xs={24}>
+            <Col md={20} xs={24}>
               <Space wrap align="center">
                 <Button
                   type="primary"
@@ -500,35 +599,26 @@ export const SearchResult = () => {
                     ? '取消全选'
                     : '全选'}
                 </Button>
-                <Checkbox.Group
-                  className="shrink-0"
-                  options={[
-                    {
-                      label: (
-                        <>
-                          <MyIcon icon="movie" size={16} className="mr-1" />
-                          电影/剧场版
-                        </>
-                      ),
-                      value: DANDAN_TYPE_MAPPING.movie,
-                    },
-                    {
-                      label: (
-                        <>
-                          <MyIcon icon="tv" size={16} className="mr-1" />
-                          电视节目
-                        </>
-                      ),
-                      value: DANDAN_TYPE_MAPPING.tvseries,
-                    },
-                  ]}
-                  value={checkedList}
-                  onChange={onTypeChange}
-                />
-              </Space>
-            </Col>
-            <Col md={11} xs={24}>
-              <Space wrap align="center">
+                <Dropdown menu={typeMenu}>
+                  <Button>
+                    {typeFilter === 'all' ? (
+                      <>
+                        <MyIcon icon="tvlibrary" size={16} className="mr-1" />
+                        按类型
+                      </>
+                    ) : typeFilter === DANDAN_TYPE_MAPPING.movie ? (
+                      <>
+                        <MyIcon icon="movie" size={16} className="mr-1" />
+                        电影/剧场版
+                      </>
+                    ) : (
+                      <>
+                        <MyIcon icon="tv" size={16} className="mr-1" />
+                        电视节目
+                      </>
+                    )}
+                  </Button>
+                </Dropdown>
                 <Dropdown menu={yearMenu} disabled={!years.length}>
                   <Button icon={<CalendarOutlined />}>
                     {yearFilter === 'all' ? '按年份' : `${yearFilter}年`}
@@ -607,6 +697,18 @@ export const SearchResult = () => {
                               ) : (
                                 <MyIcon icon="tv" size={20} className="ml-2" />
                               )}
+                              {item.url && (
+                                <a
+                                  href={item.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="ml-2 text-blue-500 hover:text-blue-700 inline-flex items-center"
+                                  title="在平台打开"
+                                >
+                                  <LinkOutlined style={{ fontSize: '18px' }} />
+                                </a>
+                              )}
                             </div>
                             <div className="flex items-center flex-wrap gap-2">
                               <Tag color="magenta">
@@ -621,9 +723,18 @@ export const SearchResult = () => {
                               <Tag color="gold">
                                 总集数：{item.episodeCount ?? 0}
                               </Tag>
+                              {searchEpisode && (
+                                <Tag color="cyan">
+                                  单集获取：{searchEpisode}
+                                </Tag>
+                              )}
                             </div>
+                            {!isMobile && <>{supplementDom(item)}</>}
                           </div>
                         </div>
+                        {isMobile && (
+                          <div className="mt-3">{supplementDom(item)}</div>
+                        )}
                       </Col>
                       <Col md={4} xs={12}>
                         <Button
@@ -643,6 +754,9 @@ export const SearchResult = () => {
                               setEditEpisodeList(res.data)
                               setEditImportOpen(true)
                               setEditItem(item)
+                              // 修正：设置区间的结束值为总集数，如果总集数为0或不存在则为1
+                              const endValue = item.episodeCount > 0 ? item.episodeCount : 1
+                              setRange([1, endValue])
                             } catch (error) {
                             } finally {
                               setEditLoading(false)
@@ -808,6 +922,29 @@ export const SearchResult = () => {
         cancelText="取消"
         okText="确认导入"
         onCancel={() => setEditImportOpen(false)}
+        footer={[
+          <Button
+            key="order"
+            type={episodeOrder === 'asc' ? 'default' : 'primary'}
+            onClick={handleToggleOrder}
+            style={{ float: 'left' }}
+          >
+            {episodeOrder === 'asc' ? '正序' : '倒序'}
+          </Button>,
+          <Button key="cancel" onClick={() => setEditImportOpen(false)}>
+            取消
+          </Button>,
+          <Button
+            key="submit"
+            type="primary"
+            loading={editConfirmLoading}
+            onClick={() => {
+              handleImportEdit()
+            }}
+          >
+            确认导入
+          </Button>,
+        ]}
       >
         <div className="flex item-wrap md:flex-nowrap justify-between items-center gap-3 my-6">
           <div className="shrink-0">作品标题:</div>
@@ -992,17 +1129,14 @@ const SortableItem = ({
     transform: CSS.Transform.toString(transform),
     transition,
     opacity: isDragging ? 0.5 : 1,
-    cursor: 'grab',
-    touchAction: 'none', // 关键：阻止浏览器默认触摸行为
-    userSelect: 'none', // 防止拖拽时选中文本
     ...(isDragging && { cursor: 'grabbing' }),
   }
 
   return (
-    <List.Item ref={setNodeRef} style={style} {...attributes}>
+    <List.Item ref={setNodeRef} style={style}>
       {/* 保留你原有的列表项渲染逻辑 */}
       <div className="w-full flex items-center justify-between">
-        <div {...listeners} style={{ cursor: 'grab' }}>
+        <div {...attributes} {...listeners} style={{ cursor: 'grab' }}>
           <MyIcon icon="drag" size={24} />
         </div>
         <div className="w-full flex items-center justify-start gap-3">

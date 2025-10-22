@@ -14,6 +14,7 @@ from ..tasks import generic_import_task
 class IncrementalRefreshJob(BaseJob):
     job_type = "incrementalRefresh"
     job_name = "定时增量追更"
+    description = "自动检测已启用追更的作品，并尝试获取下一集的弹幕数据。适用于正在连载的动画/电视剧。"
 
     async def run(self, session: AsyncSession, progress_callback: Callable):
         """定时任务的核心逻辑: 按最新分集ID+1 抓取新集"""
@@ -58,7 +59,8 @@ class IncrementalRefreshJob(BaseJob):
                         doubanId=None, tmdbId=info.get("tmdbId"), imdbId=None, tvdbId=None,
                         bangumiId=info.get("bangumiId"), metadata_manager=self.metadata_manager,
                         progress_callback=cb, session=s, manager=self.scraper_manager,
-                        task_manager=self.task_manager, rate_limiter=self.rate_limiter
+                        task_manager=self.task_manager, rate_limiter=self.rate_limiter,
+                        config_manager=self.config_manager, title_recognition_manager=self.title_recognition_manager
                     )
                 
                 try:

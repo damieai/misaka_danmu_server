@@ -12,6 +12,8 @@ from .. import crud, models
 from .base import BaseMetadataSource, HTTPStatusError
 
 logger = logging.getLogger(__name__)
+# 新增：获取用于记录元数据响应的专用 logger
+metadata_logger = logging.getLogger('metadata_responses')
 
 # --- Pydantic Models for Douban JSON API ---
 class DoubanJsonSearchSubject(BaseModel):
@@ -30,7 +32,8 @@ class DoubanJsonSearchResponse(BaseModel):
 class DoubanMetadataSource(BaseMetadataSource): # type: ignore
     provider_name = "douban" # type: ignore
     test_url = "https://movie.douban.com"
-
+    has_force_aux_search_toggle = True # 新增：硬编码标志
+    is_failover_source = True
     async def _create_client(self) -> httpx.AsyncClient:
         """Creates an httpx.AsyncClient with Douban cookie and proxy settings."""
         cookie = await self.config_manager.get("doubanCookie", "")
@@ -48,7 +51,7 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
             metadata_settings = await crud.get_all_metadata_source_settings(session)
 
         provider_setting = next((s for s in metadata_settings if s['providerName'] == self.provider_name), None)
-        use_proxy_for_this_provider = provider_setting.get('use_proxy', False) if provider_setting else False
+        use_proxy_for_this_provider = provider_setting.get('useProxy', False) if provider_setting else False
 
         proxy_to_use = proxy_url if proxy_enabled_globally and use_proxy_for_this_provider and proxy_url else None
 
@@ -57,6 +60,20 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
     async def search(self, keyword: str, user: models.User, mediaType: Optional[str] = None) -> List[models.MetadataDetailsResponse]:
         self.logger.info(f"豆瓣: 正在使用JSON API搜索 '{keyword}'")
         try:
+            provider_setting = await self._get_provider_setting()
+            log_raw = provider_setting.get('logRawResponses', False)
+
+            async def log_response(name: str, response: httpx.Response):
+                if log_raw:
+                    log_message = (
+                        f"Douban API Response for '{name}':\n"
+                        f"URL: {response.url}\n"
+                        f"Status Code: {response.status_code}\n"
+                        f"Body: {response.text}\n"
+                        "----------------------------------------"
+                    )
+                    metadata_logger.info(log_message)
+
             async with await self._create_client() as client:
                 movie_task = client.get("https://movie.douban.com/j/search_subjects", params={"type": "movie", "tag": keyword, "page_limit": 20, "page_start": 0})
                 tv_task = client.get("https://movie.douban.com/j/search_subjects", params={"type": "tv", "tag": keyword, "page_limit": 20, "page_start": 0})
@@ -65,6 +82,7 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
                 all_subjects = []
                 for res in [movie_res, tv_res]:
                     if isinstance(res, httpx.Response) and res.status_code == 200:
+                        await log_response(f"search '{keyword}'", res)
                         try:
                             data = DoubanJsonSearchResponse.model_validate(res.json())
                             all_subjects.extend(data.subjects)
@@ -90,9 +108,17 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
     async def get_details(self, item_id: str, user: models.User, mediaType: Optional[str] = None) -> Optional[models.MetadataDetailsResponse]:
         self.logger.info(f"豆瓣: 正在获取详情 item_id={item_id}")
         try:
+            provider_setting = await self._get_provider_setting()
+            log_raw = provider_setting.get('logRawResponses', False)
+
             async with await self._create_client() as client:
                 details_url = f"https://movie.douban.com/subject/{item_id}/"
                 response = await client.get(details_url)
+
+                if log_raw:
+                    log_message = f"Douban Detail Page Response for ID '{item_id}':\nStatus: {response.status_code}\nBody:\n{response.text[:1000]}...\n----------------------------------------"
+                    metadata_logger.info(log_message)
+
                 response.raise_for_status()
                 html = response.text
 
@@ -108,13 +134,22 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
                 imdb_id_match = re.search(r'<a href="https://www.imdb.com/title/(tt\d+)"', html)
                 imdb_id = imdb_id_match.group(1) if imdb_id_match else None
 
+                # 提取年份信息
+                year = None
+                year_match = re.search(r'<span class="year">\((\d{4})\)</span>', html)
+                if year_match:
+                    try:
+                        year = int(year_match.group(1))
+                    except (ValueError, TypeError):
+                        pass
+
                 if title:
                     aliases_cn.insert(0, title)
                 aliases_cn = list(dict.fromkeys(aliases_cn))
 
                 return models.MetadataDetailsResponse(
                     id=item_id, doubanId=item_id, title=title,
-                    imdbId=imdb_id, aliasesCn=aliases_cn,
+                    imdbId=imdb_id, aliasesCn=aliases_cn, year=year
                 )
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 403:
@@ -129,6 +164,9 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
         self.logger.info(f"豆瓣: 正在为 '{keyword}' 搜索别名")
         local_aliases: Set[str] = set()
         try:
+            provider_setting = await self._get_provider_setting()
+            log_raw = provider_setting.get('logRawResponses', False)
+
             async with await self._create_client() as client:
                 movie_task = client.get("https://movie.douban.com/j/search_subjects", params={"type": "movie", "tag": keyword, "page_limit": 1, "page_start": 0})
                 tv_task = client.get("https://movie.douban.com/j/search_subjects", params={"type": "tv", "tag": keyword, "page_limit": 1, "page_start": 0})
@@ -136,9 +174,17 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
 
                 best_subject_id = None
                 if isinstance(movie_res, httpx.Response) and movie_res.status_code == 200:
+                    if log_raw:
+                        metadata_logger.info(
+                            f"Douban Alias Search (Movie) for '{keyword}':\nBody: {movie_res.text}\n----------------------------------------"
+                        )
                     if subjects := movie_res.json().get('subjects', []):
                         best_subject_id = subjects[0]['id']
                 if not best_subject_id and isinstance(tv_res, httpx.Response) and tv_res.status_code == 200:
+                    if log_raw:
+                        metadata_logger.info(
+                            f"Douban Alias Search (TV) for '{keyword}':\nBody: {tv_res.text}\n----------------------------------------"
+                        )
                     if subjects := tv_res.json().get('subjects', []):
                         best_subject_id = subjects[0]['id']
 
@@ -153,28 +199,28 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
         return {alias for alias in local_aliases if alias}
 
     async def check_connectivity(self) -> str:
+        """检查豆瓣源配置状态"""
         try:
-            # 修正：在创建客户端之前就确定是否使用代理，以避免AttributeError
-            proxy_url = await self.config_manager.get("proxyUrl", "")
-            proxy_enabled_globally = (await self.config_manager.get("proxyEnabled", "false")).lower() == 'true'
-            async with self._session_factory() as session:
-                metadata_settings = await crud.get_all_metadata_source_settings(session)
-            provider_setting = next((s for s in metadata_settings if s['providerName'] == self.provider_name), None)
-            use_proxy_for_this_provider = provider_setting.get('useProxy', False) if provider_setting else False
-            is_using_proxy = proxy_enabled_globally and use_proxy_for_this_provider and proxy_url
-            if is_using_proxy:
-                self.logger.debug(f"Douban: 连接性检查将使用代理: {proxy_url}")
-            async with await self._create_client() as client:
-                response = await client.get("https://movie.douban.com", timeout=10.0)
-                if "sec.douban.com" in str(response.url):
-                    return "通过代理连接失败 (需验证)" if is_using_proxy else "连接失败 (需验证)"
-                if response.status_code == 200:
-                    return "通过代理连接成功" if is_using_proxy else "连接成功"
-                else:
-                    return f"通过代理连接失败 ({response.status_code})" if is_using_proxy else f"连接失败 ({response.status_code})"
+            # 检查Cookie配置
+            douban_cookie = await self.config_manager.get("doubanCookie", "")
+            if not douban_cookie or douban_cookie.strip() == "":
+                return "未配置 (缺少豆瓣Cookie)"
+
+            # 检查Cookie格式是否合理
+            if "bid=" not in douban_cookie and "dbcl2=" not in douban_cookie:
+                return "配置异常 (Cookie格式不正确)"
+
+            return "配置正常"
         except Exception as e:
-            return f"连接失败: {e}" # 代理信息已包含在异常中
+            return f"配置检查失败: {e}"
 
     async def execute_action(self, action_name: str, payload: Dict, user: models.User) -> Any:
         """Douban source does not support custom actions."""
         raise NotImplementedError(f"源 '{self.provider_name}' 不支持任何自定义操作。")
+
+    async def _get_provider_setting(self) -> Dict[str, Any]:
+        """辅助函数，用于从数据库获取当前源的设置。"""
+        async with self._session_factory() as session:
+            settings = await crud.get_all_metadata_source_settings(session)
+            provider_setting = next((s for s in settings if s['providerName'] == self.provider_name), None)
+            return provider_setting or {}

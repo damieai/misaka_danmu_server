@@ -1,5 +1,8 @@
 import api from './fetch'
 
+/** 获取应用版本号 */
+export const getVersion = () => api.get('/api/ui/version')
+
 /** -------------------------------------------------用户相关开始------------------------------------------------- */
 /** 登录 */
 export const login = data =>
@@ -120,9 +123,9 @@ export const pauseTask = data => api.post(`/api/ui/tasks/${data.taskId}/pause`)
 export const resumeTask = data =>
   api.post(`/api/ui/tasks/${data.taskId}/resume`)
 /** 删除任务 */
-export const deleteTask = data => api.delete(`/api/ui/tasks/${data.taskId}`)
+export const deleteTask = data => api.delete(`/api/ui/tasks/${data.taskId}`, { params: { force: data.force || false } })
 /** 中止任务 */
-export const stopTask = data => api.post(`/api/ui/tasks/${data.taskId}/abort`)
+export const stopTask = data => api.post(`/api/ui/tasks/${data.taskId}/abort`, { force: data.force || false })
 /** 定时任务列表 */
 export const getScheduledTaskList = data =>
   api.get('/api/ui/scheduled-tasks', data)
@@ -182,16 +185,51 @@ export const deleteUaRule = data => api.delete(`/api/ui/ua-rules/${data.id}`)
 
 /** 弹幕输出控制 单源输出总数 */
 export const getDanmuOutputTotal = () =>
-  api.get('/api/ui/config/danmaku_output_limit_per_source')
+  api.get('/api/ui/config/danmakuOutputLimitPerSource')
 
 export const setDanmuOutputTotal = data =>
-  api.put('/api/ui/config/danmaku_output_limit_per_source', data)
+  api.put('/api/ui/config/danmakuOutputLimitPerSource', data)
 /** 弹幕输出控制 启用弹幕聚合 */
 export const getDanmuOutputAggregation = () =>
-  api.get('/api/ui/config/danmaku_aggregation_enabled')
+  api.get('/api/ui/config/danmakuAggregationEnabled')
 /** 弹幕输出控制 启用弹幕聚合 */
 export const setDanmuOutputAggregation = data =>
-  api.put('/api/ui/config/danmaku_aggregation_enabled', data)
+  api.put('/api/ui/config/danmakuAggregationEnabled', data)
+
+/** 获取匹配后备机制状态 */
+export const getMatchFallback = () =>
+  api.get('/api/ui/config/matchFallbackEnabled')
+/** 设置匹配后备机制状态 */
+export const setMatchFallback = data =>
+  api.put('/api/ui/config/matchFallbackEnabled', data)
+
+/** 获取匹配后备黑名单 */
+export const getMatchFallbackBlacklist = () =>
+  api.get('/api/ui/config/matchFallbackBlacklist')
+/** 设置匹配后备黑名单 */
+export const setMatchFallbackBlacklist = data =>
+  api.put('/api/ui/config/matchFallbackBlacklist', data)
+
+/** 获取自定义弹幕路径配置 */
+export const getCustomDanmakuPath = () =>
+  api.get('/api/ui/config/customDanmakuPath')
+/** 设置自定义弹幕路径配置 */
+export const setCustomDanmakuPath = data =>
+  api.put('/api/ui/config/customDanmakuPath', data)
+
+/** 获取匹配后备Token配置 */
+export const getMatchFallbackTokens = () =>
+  api.get('/api/ui/config/matchFallbackTokens')
+/** 设置匹配后备Token配置 */
+export const setMatchFallbackTokens = data =>
+  api.put('/api/ui/config/matchFallbackTokens', data)
+
+/** 获取后备搜索状态 */
+export const getSearchFallback = () =>
+  api.get('/api/ui/config/searchFallbackEnabled')
+/** 设置后备搜索状态 */
+export const setSearchFallback = data =>
+  api.put('/api/ui/config/searchFallbackEnabled', data)
 
 /** ---------------------------------------------- webhook ----------------------------------------------*/
 /** 获取webhook apikey */
@@ -210,13 +248,16 @@ export const getWebhookServices = () => api.get('/api/ui/webhooks/available')
 /** 获取webhook设置 */
 export const getWebhookSettings = () => api.get('/api/ui/settings/webhook')
 /** 设置webhook设置 */
-export const setWebhookSettings = data => api.put('/api/ui/settings/webhook', data)
+export const setWebhookSettings = data =>
+  api.put('/api/ui/settings/webhook', data)
 /** 获取webhook任务列表 */
 export const getWebhookTasks = data => api.get('/api/ui/webhook-tasks', data)
 /** 批量删除webhook任务 */
-export const deleteWebhookTasks = data => api.post('/api/ui/webhook-tasks/delete-bulk', data)
+export const deleteWebhookTasks = data =>
+  api.post('/api/ui/webhook-tasks/delete-bulk', data)
 /** 立即执行webhook任务 */
-export const runWebhookTasksNow = data => api.post('/api/ui/webhook-tasks/run-now', data)
+export const runWebhookTasksNow = data =>
+  api.post('/api/ui/webhook-tasks/run-now', data)
 
 /** ---------------------------------------------- Bangumi  ----------------------------------------------*/
 /** 获取bangumi api配置 */
@@ -282,10 +323,16 @@ export const getMetaData = () => api.get('/api/ui/metadata-sources')
 /** 设置元数据 配置 */
 export const setMetaData = data => api.put('/api/ui/metadata-sources', data)
 
+/** 获取单个元数据源的配置 (新) */
+export const getProviderConfig = data =>
+  api.get(`/api/ui/metadata-sources/${data.providerName}/config`)
+
+/** 设置单个元数据源的配置 (新) */
+export const setProviderConfig = (providerName, data) =>
+  api.put(`/api/ui/metadata-sources/${providerName}/config`, data)
 /** ---------------------------------------------- 全局过滤设置 ----------------------------------------------  */
 /** 获取全局过滤规则 */
-export const getGlobalFilter = () =>
-  api.get('/api/ui/settings/global-filter')
+export const getGlobalFilter = () => api.get('/api/ui/settings/global-filter')
 /** 更新全局过滤规则 */
 export const setGlobalFilter = data =>
   api.put('/api/ui/settings/global-filter', data)
@@ -431,3 +478,20 @@ export const refreshControlApiKey = () =>
 
 /** apikey 访问日志 */
 export const getControlApiKeyLog = () => api.get('api/ui/external-logs')
+
+/** 识别词管理 */
+export const getRecognition = () =>
+  api.get('/api/ui/settings/title-recognition')
+
+export const setRecognition = data =>
+  api.put('/api/ui/settings/title-recognition', data)
+
+/** 获取TMDB反查配置 */
+export const getTmdbReverseLookupConfig = () => api.get('/api/ui/config/tmdbReverseLookup')
+
+/** 保存TMDB反查配置 */
+export const saveTmdbReverseLookupConfig = (data) => api.post('/api/ui/config/tmdbReverseLookup', data)
+
+/** 通用配置管理 */
+export const getConfig = (key) => api.get(`/api/ui/config/${key}`)
+export const setConfig = (key, value) => api.put(`/api/ui/config/${key}`, { value })

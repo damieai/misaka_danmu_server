@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import json
 from typing import Callable
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,6 +13,7 @@ logger = logging.getLogger(__name__)
 class WebhookProcessorJob(BaseJob):
     job_type = "webhookProcessor"
     job_name = "Webhook 延时任务处理器"
+    description = "定期检查并处理来自Emby/Jellyfin等媒体服务器的延时Webhook请求，自动导入新增的剧集弹幕。"
 
     async def run(self, session: AsyncSession, progress_callback: Callable):
         """
@@ -32,15 +34,11 @@ class WebhookProcessorJob(BaseJob):
             await progress_callback(progress, f"正在处理任务 {i+1}/{total_tasks}: {task.taskTitle}")
 
             try:
-                # 标记任务为正在处理
-                await crud.update_webhook_task_status(session, task.id, "processing")
-                await session.commit()
-
                 # 解析 payload 并提交到 TaskManager
                 payload = task.payload
                 if isinstance(payload, str):
-                    payload = eval(payload)
-                
+                    payload = json.loads(payload)
+
                 # 使用 webhook_search_and_dispatch_task 的逻辑
                 task_coro = lambda s, cb: webhook_search_and_dispatch_task(
                     webhookSource=task.webhookSource,
@@ -51,15 +49,22 @@ class WebhookProcessorJob(BaseJob):
                     metadata_manager=self.metadata_manager,
                     config_manager=self.config_manager,
                     rate_limiter=self.rate_limiter,
+                    title_recognition_manager=self.title_recognition_manager,
                     **payload
                 )
-                await self.task_manager.submit_task(task_coro, task.taskTitle, unique_key=task.uniqueKey)
+                # 修正：使用 run_immediately=True 来串行执行任务，避免并发冲突
+                # 这样每个任务都会立即执行并完成，而不是加入队列等待
+                task_id, done_event = await self.task_manager.submit_task(
+                    task_coro, task.taskTitle, unique_key=task.uniqueKey, run_immediately=True
+                )
+                # 等待任务完成
+                await done_event.wait()
+                # 修正：只有在任务成功提交并完成后才删除记录
+                await session.delete(task)
 
             except Exception as e:
                 logger.error(f"处理 Webhook 任务 (ID: {task.id}) 时失败: {e}", exc_info=True)
+                # 如果提交失败，则将任务标记为失败，以便用户可以手动重试
                 await crud.update_webhook_task_status(session, task.id, "failed")
-            else:
-                # 修正：只有在任务成功提交后才删除记录
-                await session.delete(task)
             finally:
                 await session.commit() # 确保状态更新或删除被提交

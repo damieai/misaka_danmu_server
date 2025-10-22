@@ -13,7 +13,7 @@ export const Douban = () => {
     setLoading(true)
     getDoubanConfig()
       .then(res => {
-        form.setFieldsValue({ cookie: res.data?.value ?? '' })
+        form.setFieldsValue({ cookie: res.data?.doubanCookie ?? '' })
       })
       .finally(() => {
         setLoading(false)
@@ -25,7 +25,7 @@ export const Douban = () => {
       setIsSaveLoading(true)
       const values = await form.validateFields()
       await setDoubanConfig({
-        value: values.cookie,
+        doubanCookie: values.cookie,
       })
       setIsSaveLoading(false)
       messageApi.success('保存成功')
@@ -50,7 +50,7 @@ export const Douban = () => {
         >
           <Form.Item
             name="cookie"
-            label="Cookie"
+            label="豆瓣 Cookie"
             rules={[{ required: true, message: '请输入豆瓣 Cookie' }]}
             className="mb-6"
           >
