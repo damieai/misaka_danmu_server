@@ -6,9 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker # type: igno
 from fastapi import Request
 from httpx import HTTPStatusError
 
-from .. import models
-from ..config_manager import ConfigManager
-from ..scraper_manager import ScraperManager
+from src.db import models, ConfigManager, CacheManager
+from src.services import ScraperManager
 
 class BaseMetadataSource(ABC):
     """所有元数据源插件的抽象基类。"""
@@ -17,11 +16,16 @@ class BaseMetadataSource(ABC):
     provider_name: str
     # 新增：声明可配置字段 { "db_key": ("UI标签", "类型", "提示") }
     configurable_fields: Dict[str, Tuple[str, str, str]] = {}
+    # 新增：是否支持获取分集URL (用于补充源功能)
+    supports_episode_urls: bool = False
+    # 新增：是否为搜索补充源（当弹幕源搜索无结果时，可为对应平台提供兜底数据）
+    is_search_supplement_source: bool = False
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], config_manager: ConfigManager, scraper_manager: ScraperManager):
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], config_manager: ConfigManager, scraper_manager: ScraperManager, cache_manager: CacheManager):
         self._session_factory = session_factory
         self.config_manager = config_manager
         self.scraper_manager = scraper_manager
+        self.cache_manager = cache_manager
         self.logger = logging.getLogger(self.__class__.__name__)
 
     @abstractmethod
@@ -40,8 +44,11 @@ class BaseMetadataSource(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def check_connectivity(self) -> str:
-        """检查源的配置状态，并返回状态字符串。"""
+    async def check_connectivity(self) -> Dict[str, str]:
+        """检查源的配置状态，并返回状态字典。
+
+        返回格式: {"code": "ok|unconfigured|warning|error|disabled", "message": "..."}
+        """
         raise NotImplementedError
     
     @abstractmethod
@@ -58,6 +65,40 @@ class BaseMetadataSource(ABC):
         当主搜索源找不到分集时使用此方法。
         """
         return None # 默认实现不执行任何操作
+
+    async def get_episode_urls(self, metadata_id: str, target_provider: Optional[str] = None) -> List[tuple]:
+        """
+        获取分集URL列表 (补充源功能)。
+
+        Args:
+            metadata_id: 元数据源中的条目ID
+            target_provider: 目标平台 (tencent/iqiyi/youku/bilibili/mgtv等), 如果为None则返回所有平台
+
+        Returns:
+            List[Tuple[int, str]]: (集数, 播放URL) 的列表
+        """
+        return [] # 默认实现返回空列表
+
+    async def supplement_search(
+        self,
+        keyword: str,
+        empty_providers: Set[str],
+        user: models.User
+    ) -> List[models.ProviderSearchInfo]:
+        """当弹幕源搜索无结果时，为对应平台提供兜底搜索结果。
+
+        子类需设 is_search_supplement_source = True 并重写此方法。
+        内部维护平台名称映射，返回的 ProviderSearchInfo.provider 使用弹幕源的名称。
+
+        Args:
+            keyword: 搜索关键词
+            empty_providers: 返回0结果的弹幕源名称集合（如 {"youku", "iqiyi"}）
+            user: 系统用户
+
+        Returns:
+            以对应弹幕源 provider 名义生成的 ProviderSearchInfo 列表
+        """
+        return []
 
     async def close(self):
         """关闭所有打开的资源，例如HTTP客户端。"""

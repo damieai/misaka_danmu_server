@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import {
   Button,
   Card,
@@ -9,14 +9,25 @@ import {
   List,
   message,
   Modal,
+  Pagination,
+  Radio,
   Select,
   Space,
+  Switch,
   Table,
   Tooltip,
+  Tag,
+  Collapse,
+  Typography,
+  Dropdown,
+  Image,
 } from 'antd'
+import { QuestionCircleOutlined, MenuOutlined, FolderOpenOutlined, SearchOutlined, LinkOutlined, EyeOutlined, AppstoreOutlined, UnorderedListOutlined } from '@ant-design/icons'
 import {
   createAnimeEntry,
   deleteAnime,
+  fetchLocalEpisodeGroupUrl,
+  applyLocalEpisodeGroup,
   getAllEpisode,
   getAnimeDetail,
   getAnimeInfoAsSource,
@@ -24,22 +35,41 @@ import {
   getBgmSearch,
   getDoubanSearch,
   getEgidSearch,
+  getEpisodeGroupDetail,
   getImdbSearch,
   getTmdbSearch,
   getTvdbSearch,
   refreshPoster,
   setAnimeDetail,
+  toggleSourceIncremental,
+  toggleSourceFinished,
+  batchSetFavorite,
+  batchUnsetFavorite,
+  downloadPosterToLocal,
+  getConfig,
+  setConfig,
+  getAnimeGroups,
+  createAnimeGroup,
+  renameAnimeGroup,
+  deleteAnimeGroup,
+  setAnimeGroupMembership,
 } from '../../apis'
+import LibraryGroupView from './LibraryGroupView'
 import { MyIcon } from '@/components/MyIcon'
 import { DANDAN_TYPE_DESC_MAPPING, DANDAN_TYPE_MAPPING } from '../../configs'
 import dayjs from 'dayjs'
 import { useNavigate } from 'react-router-dom'
 import { CreateAnimeModal } from '../../components/CreateAnimeModal'
+import { IncrementalRefreshModal } from '../../components/IncrementalRefreshModal'
+import { ScanDuplicatesModal } from '../../components/ScanDuplicatesModal'
 import { RoutePaths } from '../../general/RoutePaths'
-import { padStart } from 'lodash'
 import { useModal } from '../../ModalContext'
 import { useMessage } from '../../MessageContext'
-import { useDebounce } from '../../hooks/useDebounce'
+import DirectoryBrowser from '../media-fetch/components/DirectoryBrowser'
+import PosterSearchModal from '../media-fetch/components/PosterSearchModal'
+import { useAtomValue } from 'jotai'
+import { isMobileAtom } from '../../../store/index.js'
+import { useDefaultPageSize } from '../../hooks/useDefaultPageSize'
 
 const ApplyField = ({ name, label, fetchedValue, form }) => {
   const currentValue = Form.useWatch(name, form)
@@ -64,16 +94,126 @@ const ApplyField = ({ name, label, fetchedValue, form }) => {
 }
 
 export const Library = () => {
+  // 从后端配置获取默认分页大小
+  const defaultPageSize = useDefaultPageSize('library')
+
   const [loading, setLoading] = useState(true)
   const [list, setList] = useState([])
-  const [keyword, setKeyword] = useState('')
+  // 从 sessionStorage 恢复上次的搜索关键词
+  const [keyword, setKeyword] = useState(() => sessionStorage.getItem('lib_keyword') || '')
+  // null 表示未从 DB 初始化，防止初始化前触发 getList
+  const [sortBy, setSortBy] = useState(null)
+  const [sortOrder, setSortOrder] = useState(null)
   const navigate = useNavigate()
+  const isMobile = useAtomValue(isMobileAtom)
   const [pagination, setPagination] = useState({
-    current: 1,
-    pageSize: 50,
+    // 从 sessionStorage 恢复上次的页码
+    current: Number(sessionStorage.getItem('lib_page') || '1'),
+    pageSize: defaultPageSize,
     total: 0,
   })
+
+  // 视图模式：'list' | 'card'
+  const [viewMode, setViewMode] = useState(() => {
+    const saved = localStorage.getItem('libraryViewMode')
+    // 兼容旧值 'group'，降级为 'list'
+    return saved === 'card' ? 'card' : 'list'
+  })
+
+  // 分组数据
+  const [groups, setGroups] = useState([])
+
+  const switchViewMode = (mode) => {
+    setViewMode(mode)
+    localStorage.setItem('libraryViewMode', mode)
+  }
+
+  // 加载所有分组
+  const loadGroups = async () => {
+    try {
+      const res = await getAnimeGroups()
+      setGroups(res.data || [])
+    } catch (e) {
+      // 静默失败
+    }
+  }
+
+  // 分组操作
+  const handleCreateGroup = async (name, animeIds) => {
+    try {
+      const res = await createAnimeGroup({ name })
+      const newGroupId = res.data?.id
+      if (newGroupId && animeIds?.length > 0) {
+        await Promise.all(animeIds.map(id => setAnimeGroupMembership(id, { groupId: newGroupId })))
+      }
+      await loadGroups()
+      getList()
+      messageApi.success(`分组「${name}」已创建`)
+    } catch (e) {
+      messageApi.error(`创建分组失败: ${e?.message || '未知错误'}`)
+    }
+  }
+
+  const handleRenameGroup = async (groupId, name) => {
+    try {
+      await renameAnimeGroup(groupId, { name })
+      await loadGroups()
+      messageApi.success('分组已重命名')
+    } catch (e) {
+      messageApi.error(`重命名失败: ${e?.message || '未知错误'}`)
+    }
+  }
+
+  const handleDeleteGroup = (group) => {
+    modalApi.confirm({
+      title: `解散分组「${group.name}」？`,
+      content: '组内条目将变为未分组，不会被删除。',
+      okText: '解散',
+      okType: 'danger',
+      onOk: async () => {
+        try {
+          await deleteAnimeGroup(group.id)
+          await loadGroups()
+          getList()
+          messageApi.success('分组已解散')
+        } catch (e) {
+          messageApi.error(`删除分组失败: ${e?.message || '未知错误'}`)
+        }
+      },
+    })
+  }
+
+  // 静默删除分组（不弹确认框，用于"拆分最后一个条目"自动清除空分组）
+  const handleDeleteGroupSilent = async (group) => {
+    try {
+      await deleteAnimeGroup(group.id)
+      await loadGroups()
+    } catch (e) {
+      messageApi.error(`删除分组失败: ${e?.message || '未知错误'}`)
+    }
+  }
+
+  const handleSetGroup = async (animeId, groupId) => {
+    try {
+      await setAnimeGroupMembership(animeId, { groupId: groupId ?? null })
+      getList()
+    } catch (e) {
+      messageApi.error(`设置分组失败: ${e?.message || '未知错误'}`)
+    }
+  }
+
+  // 当默认分页大小加载完成后，更新 pagination
+  useEffect(() => {
+    if (defaultPageSize) {
+      setPagination(prev => ({
+        ...prev,
+        pageSize: defaultPageSize
+      }))
+    }
+  }, [defaultPageSize])
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false)
+  const [isRefreshModalOpen, setIsRefreshModalOpen] = useState(false)
+  const [isScanDuplicatesOpen, setIsScanDuplicatesOpen] = useState(false)
 
   const [form] = Form.useForm()
   const [editOpen, setEditOpen] = useState(false)
@@ -87,10 +227,25 @@ export const Library = () => {
   const type = Form.useWatch('type', form)
   const animeId = Form.useWatch('animeId', form)
   const imageUrl = Form.useWatch('imageUrl', form)
+  const egidValue = Form.useWatch('tmdbEpisodeGroupId', form)
   const [fetchedMetadata, setFetchedMetadata] = useState(null)
+
+  // 海报搜索与本地海报状态
+  const [posterSearchVisible, setPosterSearchVisible] = useState(false)
+  const [localImagePath, setLocalImagePath] = useState(null)
+  const [downloadingLocal, setDownloadingLocal] = useState(false)
+  const [previewVisible, setPreviewVisible] = useState(false)
 
   const modalApi = useModal()
   const messageApi = useMessage()
+  const deleteFilesRef = useRef(true) // 删除时是否同时删除弹幕文件，默认为 true
+
+  // 源选择弹窗状态（用于标记和追更操作）
+  const [sourceSelectOpen, setSourceSelectOpen] = useState(false)
+  const [sourceSelectAction, setSourceSelectAction] = useState(null) // 'favorite' | 'incremental'
+  const [sourceSelectSources, setSourceSelectSources] = useState([])
+  const [sourceSelectTitle, setSourceSelectTitle] = useState('')
+  const [selectedSourceId, setSelectedSourceId] = useState(null)
 
   const getList = async () => {
     try {
@@ -99,6 +254,8 @@ export const Library = () => {
         keyword: keyword,
         page: pagination.current,
         pageSize: pagination.pageSize,
+        sortBy,
+        sortOrder,
       })
       setList(res.data?.list || [])
       setPagination(prev => ({
@@ -132,8 +289,50 @@ export const Library = () => {
   }, [keyword])
 
   useEffect(() => {
+    // sortBy/sortOrder 未从 DB 初始化完成时不触发
+    if (sortBy === null || sortOrder === null) return
     getList()
-  }, [keyword, pagination.current, pagination.pageSize])
+  }, [keyword, pagination.current, pagination.pageSize, sortBy, sortOrder])
+
+  // mount 时从 DB 读取上次保存的排序配置，读完后才触发 getList
+  // sessionStorage 中若有缓存的排序状态，优先使用（返回弹幕库时恢复）
+  useEffect(() => {
+    Promise.all([
+      getConfig('librarySortBy'),
+      getConfig('librarySortOrder'),
+    ]).then(([byRes, orderRes]) => {
+      const cachedSortBy = sessionStorage.getItem('lib_sortBy')
+      const cachedSortOrder = sessionStorage.getItem('lib_sortOrder')
+      setSortBy(cachedSortBy || byRes.data?.value || 'anime_created')
+      setSortOrder(cachedSortOrder || orderRes.data?.value || 'desc')
+    }).catch(() => {
+      const cachedSortBy = sessionStorage.getItem('lib_sortBy')
+      const cachedSortOrder = sessionStorage.getItem('lib_sortOrder')
+      // 读取失败则使用缓存值或默认值
+      setSortBy(cachedSortBy || 'anime_created')
+      setSortOrder(cachedSortOrder || 'desc')
+    })
+    // 初始化加载分组数据
+    loadGroups()
+  }, [])
+
+  useEffect(() => {
+    setSearchInputValue(keyword)
+    // 同步搜索关键词到 sessionStorage，下次返回弹幕库时可恢复
+    sessionStorage.setItem('lib_keyword', keyword)
+  }, [keyword])
+
+  // 同步分页状态到 sessionStorage
+  useEffect(() => {
+    sessionStorage.setItem('lib_page', String(pagination.current))
+    sessionStorage.setItem('lib_pageSize', String(pagination.pageSize))
+  }, [pagination.current, pagination.pageSize])
+
+  // 同步排序状态到 sessionStorage
+  useEffect(() => {
+    if (sortBy) sessionStorage.setItem('lib_sortBy', sortBy)
+    if (sortOrder) sessionStorage.setItem('lib_sortOrder', sortOrder)
+  }, [sortBy, sortOrder])
 
   useEffect(() => {
     if (!fetchedMetadata) return
@@ -173,115 +372,111 @@ export const Library = () => {
     }
   }, [fetchedMetadata, form])
 
+
+  // antd Table columns 定义（传给 LibraryGroupView 用于拖拽表格）
   const columns = [
     {
       title: '海报',
       dataIndex: 'imageUrl',
       key: 'imageUrl',
-      width: 100,
+      width: 96,
       render: (_, record) => {
         let imageSrc = record.localImagePath || record.imageUrl
-        // 兼容旧的、错误的缓存路径
-        if (imageSrc && imageSrc.startsWith('/images/')) {
-          imageSrc = imageSrc.replace('/images/', '/data/images/')
-        }
-        // 如果两个地址都为空，则不渲染img标签，避免出现损坏的图片图标
-        return imageSrc ? <img src={imageSrc} className="w-12" /> : null
+        if (imageSrc?.startsWith('/images/')) imageSrc = imageSrc.replace('/images/', '/data/images/')
+        const hasFav = record.sources?.some(s => s.isFavorited)
+        const hasInc = record.sources?.some(s => s.incrementalRefreshEnabled)
+        const allFin = record.sources?.length > 0 && record.sources.every(s => s.isFinished)
+        return (
+          <div className="inline-flex flex-col items-center gap-0.5" style={{ width: 56 }}>
+            {imageSrc ? (
+              <img src={imageSrc} style={{ width: 56, height: 80, objectFit: 'cover', borderRadius: 4, cursor: 'pointer', display: 'block' }}
+                onClick={() => navigate(`/anime/${record.animeId}`)} alt={record.title} />
+            ) : (
+              <div style={{ width: 56, height: 80, borderRadius: 4, background: '#f0f0f0', cursor: 'pointer' }}
+                onClick={() => navigate(`/anime/${record.animeId}`)} />
+            )}
+            {/* 海报下方状态图标 */}
+            {(hasFav || hasInc || allFin) && (
+              <div className="flex items-center justify-center gap-0.5">
+                {allFin && <MyIcon icon="wanjie1" size={13} color="#60a5fa" />}
+                {hasInc && <MyIcon icon="zengliang" size={13} color="#4ade80" />}
+                {hasFav && <MyIcon icon="favorites-fill" size={13} color="#facc15" />}
+              </div>
+            )}
+          </div>
+        )
       },
     },
     {
       title: '影视名称',
       dataIndex: 'title',
       key: 'title',
-      width: 200,
     },
     {
       title: '类型',
-      width: 100,
       dataIndex: 'type',
       key: 'type',
-      render: (_, record) => {
-        return <span>{DANDAN_TYPE_DESC_MAPPING[record.type]}</span>
-      },
+      width: 90,
+      render: (_, record) => <span>{DANDAN_TYPE_DESC_MAPPING[record.type]}</span>,
     },
-    {
-      title: '季',
-      dataIndex: 'season',
-      key: 'season',
-      width: 50,
-    },
-    {
-      title: '年份',
-      dataIndex: 'year',
-      key: 'year',
-      width: 80,
-    },
-    {
-      title: '集数',
-      dataIndex: 'episodeCount',
-      key: 'episodeCount',
-      width: 50,
-    },
-    {
-      title: '源数量',
-      dataIndex: 'sourceCount',
-      key: 'sourceCount',
-      width: 80,
-    },
+    { title: '季', dataIndex: 'season', key: 'season', width: 50 },
+    { title: '年份', dataIndex: 'year', key: 'year', width: 70 },
+    { title: '集数', dataIndex: 'episodeCount', key: 'episodeCount', width: 60 },
+    { title: '源数量', dataIndex: 'sourceCount', key: 'sourceCount', width: 70 },
     {
       title: '收录时间',
       dataIndex: 'createdAt',
       key: 'createdAt',
-      width: 200,
-      render: (_, record) => {
-        return (
-          <div>{dayjs(record.createdAt).format('YYYY-MM-DD HH:mm:ss')}</div>
-        )
-      },
+      width: 150,
+      render: (_, record) => <span>{dayjs(record.createdAt).format('YYYY-MM-DD HH:mm')}</span>,
     },
     {
       title: '操作',
-      width: 100,
+      width: 140,
       fixed: 'right',
       render: (_, record) => {
+        const hasFavorited = record.sources?.some(s => s.isFavorited)
+        const hasIncremental = record.sources?.some(s => s.incrementalRefreshEnabled)
+        const allFinished = record.sources?.length > 0 && record.sources.every(s => s.isFinished)
         return (
           <Space>
-            <Tooltip title="编辑影视信息">
-              <span
-                className="cursor-pointer hover:text-primary"
-                onClick={async () => {
-                  const res = await getAnimeDetail({
-                    animeId: record.animeId,
-                  })
-                  form.setFieldsValue({
-                    ...(res.data || {}),
-                    animeId: record.animeId,
-                  })
+            <Tooltip title="编辑">
+              <span className="cursor-pointer hover:text-primary"
+                onClick={async (e) => {
+                  e.stopPropagation()
+                  const res = await getAnimeDetail({ animeId: record.animeId })
+                  form.resetFields()
+                  form.setFieldsValue({ ...(res.data || {}), animeId: record.animeId })
+                  setLocalImagePath(res.data?.localImagePath || null)
                   setEditOpen(true)
-                }}
-              >
-                <MyIcon icon="edit" size={20}></MyIcon>
+                }}>
+                <MyIcon icon="edit" size={20} />
               </span>
             </Tooltip>
-
+            <Dropdown
+              menu={{
+                items: [
+                  { key: 'fav', label: hasFavorited ? '取消标记' : '标记', icon: <MyIcon icon={hasFavorited ? 'favorites-fill' : 'favorites'} size={16} className={hasFavorited ? 'text-yellow-400' : ''} />, onClick: (e) => { e.domEvent?.stopPropagation?.(); handleFavorite(record) } },
+                  { key: 'inc', label: hasIncremental ? '取消追更' : '追更', icon: <MyIcon icon={hasIncremental ? 'zengliang' : 'clock'} size={16} className={hasIncremental ? 'text-green-500' : ''} />, onClick: (e) => { e.domEvent?.stopPropagation?.(); handleIncremental(record) } },
+                  { key: 'fin', label: allFinished ? '取消完结' : '完结', icon: <MyIcon icon={allFinished ? 'wanjie1' : 'wanjie'} size={16} className={allFinished ? 'text-blue-500' : 'text-gray-400'} />, onClick: (e) => { e.domEvent?.stopPropagation?.(); handleFinished(record) } },
+                ],
+              }}
+              trigger={['click']}
+            >
+              <span className="cursor-pointer hover:text-primary" onClick={e => e.stopPropagation()}>
+                <MenuOutlined style={{ fontSize: 18 }} />
+              </span>
+            </Dropdown>
             <Tooltip title="详情">
-              <span
-                className="cursor-pointer hover:text-primary"
-                onClick={() => {
-                  navigate(`/anime/${record.animeId}`)
-                }}
-              >
-                <MyIcon icon="book" size={20}></MyIcon>
+              <span className="cursor-pointer hover:text-primary"
+                onClick={(e) => { e.stopPropagation(); if (record.animeId) navigate(`/anime/${record.animeId}`) }}>
+                <MyIcon icon="book" size={20} />
               </span>
             </Tooltip>
             <Tooltip title="删除">
-              <span
-                className="cursor-pointer hover:text-primary"
-                onClick={() => {
-                  handleDelete(record)
-                }}
-              >
-                <MyIcon icon="delete" size={20}></MyIcon>
+              <span className="cursor-pointer hover:text-primary"
+                onClick={(e) => { e.stopPropagation(); handleDelete(record) }}>
+                <MyIcon icon="delete" size={20} />
               </span>
             </Tooltip>
           </Space>
@@ -290,7 +485,122 @@ export const Library = () => {
     },
   ]
 
+  // 处理标记操作
+  const handleFavorite = async (record) => {
+    const sources = record.sources || []
+    if (sources.length === 0) {
+      messageApi.warning('该作品没有数据源')
+      return
+    }
+    const hasFav = sources.some(s => s.isFavorited)
+    if (hasFav) {
+      // 当前有标记 → 取消该作品所有源的标记
+      try {
+        await batchUnsetFavorite({ sourceIds: sources.map(s => s.sourceId) })
+        messageApi.success('已取消标记')
+        getList()
+      } catch (error) {
+        messageApi.error('操作失败')
+      }
+    } else {
+      // 当前无标记 → 需要选择一个源来标记
+      if (sources.length === 1) {
+        // 只有一个源，直接设为标记
+        try {
+          await batchSetFavorite({ sourceIds: [sources[0].sourceId] })
+          messageApi.success('标记状态已更新')
+          getList()
+        } catch (error) {
+          messageApi.error('操作失败')
+        }
+      } else {
+        // 多个源，弹窗选择
+        setSourceSelectAction('favorite')
+        setSourceSelectSources(sources)
+        setSourceSelectTitle(record.title)
+        setSelectedSourceId(sources[0].sourceId)
+        setSourceSelectOpen(true)
+      }
+    }
+  }
+
+  // 处理追更操作
+  const handleIncremental = async (record) => {
+    const sources = record.sources || []
+    if (sources.length === 0) {
+      messageApi.warning('该作品没有数据源')
+      return
+    }
+    if (sources.length === 1) {
+      // 只有一个源，直接切换
+      try {
+        await toggleSourceIncremental({ sourceId: sources[0].sourceId })
+        messageApi.success('追更状态已更新')
+        getList()
+      } catch (error) {
+        messageApi.error('操作失败')
+      }
+    } else {
+      // 多个源，弹窗选择
+      setSourceSelectAction('incremental')
+      setSourceSelectSources(sources)
+      setSourceSelectTitle(record.title)
+      setSelectedSourceId(sources.find(s => s.incrementalRefreshEnabled)?.sourceId || sources[0].sourceId)
+      setSourceSelectOpen(true)
+    }
+  }
+
+  // 处理完结操作
+  const handleFinished = async (record) => {
+    const sources = record.sources || []
+    if (sources.length === 0) {
+      messageApi.warning('该作品没有数据源')
+      return
+    }
+    if (sources.length === 1) {
+      try {
+        await toggleSourceFinished({ sourceId: sources[0].sourceId })
+        messageApi.success('完结状态已更新')
+        getList()
+      } catch (error) {
+        messageApi.error('操作失败')
+      }
+    } else {
+      setSourceSelectAction('finished')
+      setSourceSelectSources(sources)
+      setSourceSelectTitle(record.title)
+      setSelectedSourceId(sources.find(s => s.isFinished)?.sourceId || sources[0].sourceId)
+      setSourceSelectOpen(true)
+    }
+  }
+
+  // 确认源选择
+  const handleSourceSelectConfirm = async () => {
+    if (!selectedSourceId) {
+      messageApi.warning('请选择一个数据源')
+      return
+    }
+    try {
+      if (sourceSelectAction === 'favorite') {
+        // 使用 batchSetFavorite 直接设为标记（而非 toggle，避免误取消）
+        await batchSetFavorite({ sourceIds: [selectedSourceId] })
+        messageApi.success('标记状态已更新')
+      } else if (sourceSelectAction === 'incremental') {
+        await toggleSourceIncremental({ sourceId: selectedSourceId })
+        messageApi.success('追更状态已更新')
+      } else if (sourceSelectAction === 'finished') {
+        await toggleSourceFinished({ sourceId: selectedSourceId })
+        messageApi.success('完结状态已更新')
+      }
+      setSourceSelectOpen(false)
+      getList()
+    } catch (error) {
+      messageApi.error('操作失败')
+    }
+  }
+
   const handleDelete = async record => {
+    deleteFilesRef.current = true // 重置为默认值
     modalApi.confirm({
       title: '删除',
       zIndex: 1002,
@@ -299,13 +609,22 @@ export const Library = () => {
           确定要删除{record.name}吗？
           <br />
           此操作将在后台提交一个删除任务
+          <div className="flex items-center gap-2 mt-3">
+            <span>同时删除弹幕文件：</span>
+            <Switch
+              defaultChecked={true}
+              onChange={checked => {
+                deleteFilesRef.current = checked
+              }}
+            />
+          </div>
         </div>
       ),
       okText: '确认',
       cancelText: '取消',
       onOk: async () => {
         try {
-          const res = await deleteAnime({ animeId: record.animeId })
+          const res = await deleteAnime({ animeId: record.animeId, deleteFiles: deleteFilesRef.current })
           goTask(res)
         } catch (error) {
           messageApi.error('提交删除任务失败')
@@ -555,22 +874,268 @@ export const Library = () => {
   const [allEpisode, setAllEpisode] = useState({})
   const [episodeOpen, setEpisodeOpen] = useState(false)
 
+  // ---- 本地剧集组 state ----
+  const [localEgOpen, setLocalEgOpen] = useState(false)
+  const [localEgParsedData, setLocalEgParsedData] = useState(null)
+  const [localEgApplyLoading, setLocalEgApplyLoading] = useState(false)
+  const [pasteJsonOpen, setPasteJsonOpen] = useState(false)
+  const [pasteJsonValue, setPasteJsonValue] = useState('')
+  const [localPathOpen, setLocalPathOpen] = useState(false)
+  const [localPathValue, setLocalPathValue] = useState('')
+  const [localPathLoading, setLocalPathLoading] = useState(false)
+  const [fileBrowserOpen, setFileBrowserOpen] = useState(false)
+
+  // 公共校验：解析并校验剧集组JSON数据
+  const validateAndApplyEgJson = (jsonStr) => {
+    try {
+      const data = JSON.parse(jsonStr)
+      if (!data.groups || !Array.isArray(data.groups) || data.groups.length === 0) {
+        messageApi.error('JSON 格式不正确：缺少有效的 groups 数组')
+        return false
+      }
+      for (const g of data.groups) {
+        if (!g.episodes || !Array.isArray(g.episodes)) {
+          messageApi.error('JSON 格式不正确：每个 group 需要包含 episodes 数组')
+          return false
+        }
+      }
+      setLocalEgParsedData(data)
+      setLocalEgOpen(true)
+      return true
+    } catch {
+      messageApi.error('内容不是有效的 JSON')
+      return false
+    }
+  }
+
+  // 查询服务端本地路径的JSON
+  const handleLocalPathConfirm = async () => {
+    const pathVal = localPathValue.trim()
+    if (!pathVal) {
+      messageApi.warning('请输入服务端路径或网络URL')
+      return
+    }
+    try {
+      setLocalPathLoading(true)
+      const res = await fetchLocalEpisodeGroupUrl({ url: pathVal })
+      if (res?.data?.groups) {
+        setLocalEgParsedData(res.data)
+        setLocalEgOpen(true)
+        setLocalPathOpen(false)
+        setLocalPathValue('')
+      } else {
+        messageApi.error('获取的JSON格式不正确，缺少 groups 字段')
+      }
+    } catch (e) {
+      messageApi.error(`获取失败: ${e?.response?.data?.detail || e.message}`)
+    } finally {
+      setLocalPathLoading(false)
+    }
+  }
+
+  // 粘贴JSON确认
+  const handlePasteJsonConfirm = () => {
+    if (!pasteJsonValue.trim()) {
+      messageApi.warning('请粘贴 JSON 内容')
+      return
+    }
+    if (validateAndApplyEgJson(pasteJsonValue)) {
+      setPasteJsonOpen(false)
+      setPasteJsonValue('')
+    }
+  }
+
+  // ---- 查看/编辑剧集组 ----
+  const [editEgOpen, setEditEgOpen] = useState(false)
+  const [editEgData, setEditEgData] = useState(null) // { id, name, description, groups: [...] }
+  const [editEgLoading, setEditEgLoading] = useState(false)
+  const [editEgSaving, setEditEgSaving] = useState(false)
+
+  const handleOpenEditEg = async () => {
+    const egidValue = form.getFieldValue('tmdbEpisodeGroupId')?.trim()
+    if (!egidValue) {
+      messageApi.warning('当前没有剧集组ID')
+      return
+    }
+    try {
+      setEditEgLoading(true)
+      // 从数据库读取已保存的剧集组映射
+      const res = await getEpisodeGroupDetail(egidValue)
+      if (res?.data?.id) {
+        const raw = res.data
+        const groups = (raw.groups || []).map((g, gi) => ({
+          _key: gi,
+          name: g.name || '',
+          order: g.order ?? gi,
+          episodes: (g.episodes || []).map((ep, ei) => ({
+            _key: ei,
+            seasonNumber: ep.seasonNumber ?? 0,
+            episodeNumber: ep.episodeNumber ?? 0,
+            order: ep.order ?? ei,
+            name: ep.name || '',
+          })),
+        }))
+        setEditEgData({ id: raw.id, name: raw.name || '', description: raw.description || '', groups })
+        setEditEgOpen(true)
+      } else {
+        messageApi.error('没有找到该剧集组的映射数据')
+      }
+    } catch (error) {
+      messageApi.error(`获取剧集组失败: ${error?.response?.data?.detail || error.message}`)
+    } finally {
+      setEditEgLoading(false)
+    }
+  }
+
+  // 编辑剧集组内部操作
+  const updateEditEgField = (path, value) => {
+    setEditEgData(prev => {
+      const next = JSON.parse(JSON.stringify(prev))
+      let target = next
+      for (let i = 0; i < path.length - 1; i++) target = target[path[i]]
+      target[path[path.length - 1]] = value
+      return next
+    })
+  }
+
+  const addEgGroup = () => {
+    setEditEgData(prev => {
+      const next = JSON.parse(JSON.stringify(prev))
+      next.groups.push({ _key: Date.now(), name: '', order: next.groups.length, episodes: [] })
+      return next
+    })
+  }
+
+  const removeEgGroup = (gi) => {
+    setEditEgData(prev => {
+      const next = JSON.parse(JSON.stringify(prev))
+      next.groups.splice(gi, 1)
+      return next
+    })
+  }
+
+  const addEgEpisode = (gi) => {
+    setEditEgData(prev => {
+      const next = JSON.parse(JSON.stringify(prev))
+      const eps = next.groups[gi].episodes
+      eps.push({ _key: Date.now(), seasonNumber: 0, episodeNumber: 0, order: eps.length, name: '' })
+      return next
+    })
+  }
+
+  const removeEgEpisode = (gi, ei) => {
+    setEditEgData(prev => {
+      const next = JSON.parse(JSON.stringify(prev))
+      next.groups[gi].episodes.splice(ei, 1)
+      return next
+    })
+  }
+
+  const handleSaveEditEg = async () => {
+    if (!editEgData) return
+    if (!tmdbId) { messageApi.warning('请先填写 TMDB ID'); return }
+    try {
+      setEditEgSaving(true)
+      // 转换为 applyLocalEpisodeGroup 需要的格式
+      const localEpisodeGroup = {
+        description: editEgData.name || '本地剧集组',
+        groups: editEgData.groups.map(g => ({
+          name: g.name,
+          order: g.order,
+          episodes: g.episodes.map(ep => ({
+            season_number: ep.seasonNumber,
+            episode_number: ep.episodeNumber,
+            order: ep.order,
+          })),
+        })),
+      }
+      const res = await applyLocalEpisodeGroup({
+        tmdbId: Number(tmdbId),
+        localEpisodeGroup,
+      })
+      if (res?.data?.groupId) {
+        form.setFieldsValue({ tmdbEpisodeGroupId: res.data.groupId })
+        messageApi.success(`剧集组已保存，共 ${res.data.episodeCount} 条映射`)
+        setEditEgOpen(false)
+        setEditEgData(null)
+      }
+    } catch (e) {
+      messageApi.error(`保存失败: ${e?.response?.data?.detail || e.message}`)
+    } finally {
+      setEditEgSaving(false)
+    }
+  }
+
+  const handleLocalEgApply = async () => {
+    if (!localEgParsedData) { messageApi.warning('请先解析剧集组数据'); return }
+    if (!tmdbId) { messageApi.warning('请先填写 TMDB ID'); return }
+    try {
+      setLocalEgApplyLoading(true)
+      const res = await applyLocalEpisodeGroup({
+        tmdbId: Number(tmdbId),
+        localEpisodeGroup: localEgParsedData,
+      })
+      if (res?.data?.groupId) {
+        form.setFieldsValue({ tmdbEpisodeGroupId: res.data.groupId })
+        messageApi.success(`本地剧集组已应用，共 ${res.data.episodeCount} 条映射`)
+        setLocalEgOpen(false)
+        setLocalEgParsedData(null)
+      }
+    } catch (e) {
+      messageApi.error(`应用失败: ${e?.response?.data?.detail || e.message}`)
+    } finally {
+      setLocalEgApplyLoading(false)
+    }
+  }
+
+  // 判断输入是否为 URL 或本地路径
+  const isEgidInputPath = (val) => {
+    if (!val) return false
+    const v = val.trim()
+    return v.startsWith('http://') || v.startsWith('https://') || v.endsWith('.json')
+  }
+
   const onEgidSearch = async () => {
     try {
       if (searchEgidLoading) return
       setSearchEgidLoading(true)
-      const res = await getEgidSearch({
-        tmdbId: tmdbId,
-        keyword: title,
-      })
-      if (!!res?.data?.length) {
-        setEgidResult(res?.data || [])
-        setEgidOpen(true)
+
+      const egidValue = form.getFieldValue('tmdbEpisodeGroupId')?.trim()
+
+      if (isEgidInputPath(egidValue)) {
+        // URL 或本地路径 → 获取JSON → 弹预览窗
+        const res = await fetchLocalEpisodeGroupUrl({ url: egidValue })
+        if (res?.data?.groups) {
+          setLocalEgParsedData(res.data)
+          setLocalEgOpen(true)
+        } else {
+          messageApi.error('获取的JSON格式不正确')
+        }
+      } else if (egidValue) {
+        // 有内容但不是路径 → 当作剧集组ID直接查详情
+        const res = await getAllEpisode({ tmdbId: tmdbId, egid: egidValue })
+        if (res?.data?.id) {
+          setAllEpisode(res.data)
+          setEpisodeOpen(true)
+        } else {
+          messageApi.error('没有找到该剧集组的分集信息')
+        }
       } else {
-        messageApi.error('没有找到相关内容')
+        // 空 → 按TMDB ID搜索剧集组列表
+        if (!tmdbId) {
+          messageApi.warning('请先填写 TMDB ID，或输入本地剧集组路径 / 网络URL')
+          return
+        }
+        const res = await getEgidSearch({ tmdbId: tmdbId, keyword: title })
+        if (res?.data?.length) {
+          setEgidResult(res.data)
+          setEgidOpen(true)
+        } else {
+          messageApi.error('没有找到相关内容')
+        }
       }
     } catch (error) {
-      messageApi.error(`剧集组搜索失败:${error.message}`)
+      messageApi.error(`剧集组搜索失败: ${error?.response?.data?.detail || error.message}`)
     } finally {
       setSearchEgidLoading(false)
     }
@@ -597,9 +1162,17 @@ export const Library = () => {
     }
   }
 
-  const handleKeywordChange = useDebounce(e => {
-    setKeyword(e.target.value)
-  }, 500)
+  // 搜索框受控值（跟随 keyword 同步，初始值也从 sessionStorage 恢复）
+  const [searchInputValue, setSearchInputValue] = useState(() => sessionStorage.getItem('lib_keyword') || '')
+
+  const handleSearch = () => {
+    setKeyword(searchInputValue)
+  }
+
+  const handleReset = () => {
+    setKeyword('')
+    setSearchInputValue('')
+  }
 
   const [bgmResult, setBgmResult] = useState([])
   const [bgmOpen, setBgmOpen] = useState(false)
@@ -624,61 +1197,265 @@ export const Library = () => {
     }
   }
 
+  // 排序选项配置（每个维度只有一项，点击同一项切换升降序）
+  const SORT_OPTIONS = [
+    { key: 'anime_created',   label: '媒体库入库时间' },
+    { key: 'episode_fetched', label: '分集入库时间'   },
+  ]
+  const currentSortLabel = SORT_OPTIONS.find(o => o.key === sortBy)?.label || '排序'
+
+  const sortDropdownItems = {
+    items: SORT_OPTIONS.map(opt => {
+      const isActive = opt.key === sortBy
+      // 激活项显示当前实际方向箭头；非激活项显示降序箭头（默认方向预览）
+      const arrowIcon = isActive
+        ? (sortOrder === 'asc' ? 'arrowTop-fill' : 'xiajiantou-')
+        : 'xiajiantou-'
+      return {
+        key: opt.key,
+        label: (
+          <span className="flex items-center gap-2">
+            <span style={{ fontWeight: isActive ? 600 : 400, color: isActive ? 'var(--ant-color-primary)' : undefined }}>
+              {opt.label}
+            </span>
+            <MyIcon
+              icon={arrowIcon}
+              size={13}
+              style={{ color: isActive ? 'var(--ant-color-primary)' : undefined }}
+            />
+          </span>
+        ),
+      }
+    }),
+    onClick: ({ key }) => {
+      if (key === sortBy) {
+        // 同一维度：切换升降序
+        const newOrder = sortOrder === 'desc' ? 'asc' : 'desc'
+        setSortOrder(newOrder)
+        setConfig('librarySortOrder', newOrder)
+      } else {
+        // 切换维度：保持当前升降序方向
+        setSortBy(key)
+        setConfig('librarySortBy', key)
+      }
+      setPagination(n => ({ ...n, current: 1 }))
+    },
+  }
+
   return (
     <div className="my-6">
       <Card
         loading={loading}
         title="弹幕库"
         extra={
-          <Space>
-            <Input
-              placeholder="搜索已收录的影视"
-              onChange={e => handleKeywordChange(e)}
-            />
-            <Button type="primary" onClick={() => setIsCreateModalOpen(true)}>
-              自定义影视条目
-            </Button>
-          </Space>
+          !isMobile && (
+            <Space>
+              <Input.Search
+                placeholder="请输入影视名称"
+                value={searchInputValue}
+                onChange={(e) => setSearchInputValue(e.target.value)}
+                onSearch={handleSearch}
+                enterButton="搜索"
+                allowClear
+                style={{ width: 300 }}
+              />
+              {keyword && (
+                <Button onClick={handleReset}>
+                  重置
+                </Button>
+              )}
+              {/* 视图切换 */}
+              <Space.Compact>
+                <Tooltip title="列表视图">
+                  <Button
+                    type={viewMode === 'list' ? 'primary' : 'default'}
+                    icon={<UnorderedListOutlined />}
+                    onClick={() => switchViewMode('list')}
+                  />
+                </Tooltip>
+                <Tooltip title="卡片视图">
+                  <Button
+                    type={viewMode === 'card' ? 'primary' : 'default'}
+                    icon={<AppstoreOutlined />}
+                    onClick={() => switchViewMode('card')}
+                  />
+                </Tooltip>
+              </Space.Compact>
+              <Dropdown menu={sortDropdownItems}>
+                <Button>
+                  <span className="flex items-center gap-1">
+                    {currentSortLabel}
+                    <MyIcon icon={sortOrder === 'asc' ? 'arrowTop-fill' : 'xiajiantou-'} size={14} />
+                  </span>
+                </Button>
+              </Dropdown>
+              <Button onClick={() => setIsScanDuplicatesOpen(true)}>
+                扫描重复项
+              </Button>
+              <Button onClick={() => setIsRefreshModalOpen(true)}>
+                批量管理
+              </Button>
+              <Button type="primary" onClick={() => setIsCreateModalOpen(true)}>
+                自定义影视条目
+              </Button>
+            </Space>
+          )
         }
       >
-        {!!list?.length ? (
-          <Table
-            pagination={{
-              ...pagination,
-              showTotal: total => `共 ${total} 条数据`,
-              onChange: (page, pageSize) => {
-                setPagination(n => {
-                  return {
-                    ...n,
-                    current: page,
-                    pageSize,
-                  }
-                })
-              },
-              onShowSizeChange: (_, size) => {
-                setPagination(n => {
-                  return {
-                    ...n,
-                    pageSize: size,
-                  }
-                })
-              },
-              hideOnSinglePage: true,
-            }}
-            size="small"
-            dataSource={list}
-            columns={columns}
-            rowKey={'animeId'}
-            scroll={{ x: '100%' }}
-          />
-        ) : (
-          <Empty />
+        {isMobile && (
+          <div className="mb-4">
+            <div className="flex gap-2 mb-3 items-center">
+              <div className="flex flex-1" style={{ height: 40 }}>
+                <Input
+                  placeholder="请输入影视名称"
+                  value={searchInputValue}
+                  onChange={(e) => setSearchInputValue(e.target.value)}
+                  onPressEnter={handleSearch}
+                  allowClear
+                  style={{
+                    height: 40,
+                    borderTopRightRadius: 0,
+                    borderBottomRightRadius: 0,
+                  }}
+                />
+                <Button
+                  type="primary"
+                  onClick={handleSearch}
+                  style={{
+                    height: 40,
+                    flexShrink: 0,
+                    borderTopLeftRadius: 0,
+                    borderBottomLeftRadius: 0,
+                    borderTopRightRadius: 8,
+                    borderBottomRightRadius: 8,
+                  }}
+                >
+                  搜索
+                </Button>
+              </div>
+              {keyword && (
+                <Button onClick={handleReset} style={{ height: 40, flexShrink: 0 }}>
+                  重置
+                </Button>
+              )}
+            </div>
+            <div className="space-y-2">
+              <div className="flex gap-2">
+                <Button
+                  block
+                  size="large"
+                  onClick={() => setIsScanDuplicatesOpen(true)}
+                >
+                  扫描重复项
+                </Button>
+                <Button
+                  block
+                  size="large"
+                  onClick={() => setIsRefreshModalOpen(true)}
+                >
+                  批量管理
+                </Button>
+              </div>
+              <div className="flex gap-2">
+                <Dropdown menu={sortDropdownItems}>
+                  <Button block size="large">
+                    <span className="flex items-center justify-center gap-1">
+                      {currentSortLabel}
+                      <MyIcon icon={sortOrder === 'asc' ? 'arrowTop-fill' : 'xiajiantou-'} size={15} />
+                    </span>
+                  </Button>
+                </Dropdown>
+                <Button
+                  type="primary"
+                  block
+                  size="large"
+                  onClick={() => setIsCreateModalOpen(true)}
+                >
+                  自定义影视条目
+                </Button>
+              </div>
+              <div className="flex gap-2">
+                <Button
+                  block
+                  size="large"
+                  type={viewMode === 'list' ? 'primary' : 'default'}
+                  icon={<UnorderedListOutlined />}
+                  onClick={() => switchViewMode('list')}
+                >
+                  列表视图
+                </Button>
+                <Button
+                  block
+                  size="large"
+                  type={viewMode === 'card' ? 'primary' : 'default'}
+                  icon={<AppstoreOutlined />}
+                  onClick={() => switchViewMode('card')}
+                >
+                  卡片视图
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+        {/* ===== 统一渲染区：LibraryGroupView 包裹列表/卡片，行/卡可拖拽分组 ===== */}
+        <LibraryGroupView
+          list={list}
+          groups={groups}
+          loading={loading}
+          viewMode={viewMode}
+          columns={columns}
+          onEdit={async (record) => {
+            const res = await getAnimeDetail({ animeId: record.animeId })
+            form.resetFields()
+            form.setFieldsValue({ ...(res.data || {}), animeId: record.animeId })
+            setLocalImagePath(res.data?.localImagePath || null)
+            setEditOpen(true)
+          }}
+          onDelete={handleDelete}
+          onNavigate={(record) => navigate(`/anime/${record.animeId}`)}
+          onFavorite={(record) => handleFavorite(record)}
+          onIncremental={(record) => handleIncremental(record)}
+          onFinished={(record) => handleFinished(record)}
+          onSetGroup={handleSetGroup}
+          onCreateGroup={handleCreateGroup}
+          onRenameGroup={handleRenameGroup}
+          onDeleteGroup={handleDeleteGroup}
+          onDeleteGroupSilent={handleDeleteGroupSilent}
+        />
+
+        {/* 分页器：在 LibraryGroupView 外部统一显示 */}
+        {pagination.total > 0 && (
+          <div className="mt-4 flex justify-end">
+            <Pagination
+              current={pagination.current}
+              pageSize={pagination.pageSize}
+              total={pagination.total}
+              showTotal={total => `共 ${total} 条数据`}
+              showSizeChanger
+              hideOnSinglePage
+              onChange={(page, pageSize) => {
+                setPagination(n => ({ ...n, current: page, pageSize }))
+              }}
+              onShowSizeChange={(_, size) => {
+                setPagination(n => ({ ...n, pageSize: size }))
+              }}
+            />
+          </div>
         )}
       </Card>
       <CreateAnimeModal
         open={isCreateModalOpen}
         onCancel={() => setIsCreateModalOpen(false)}
         onSuccess={handleCreateSuccess}
+      />
+      <IncrementalRefreshModal
+        open={isRefreshModalOpen}
+        onCancel={() => setIsRefreshModalOpen(false)}
+      />
+      <ScanDuplicatesModal
+        open={isScanDuplicatesOpen}
+        onCancel={() => setIsScanDuplicatesOpen(false)}
+        onSuccess={() => { setIsScanDuplicatesOpen(false); fetchList() }}
       />
       <Modal
         title="编辑影视信息"
@@ -690,6 +1467,7 @@ export const Library = () => {
         onCancel={() => {
           setEditOpen(false)
           setFetchedMetadata(null)
+          setLocalImagePath(null)
         }}
         zIndex={100}
       >
@@ -734,27 +1512,65 @@ export const Library = () => {
               placeholder="请输入发行年份"
             />
           </Form.Item>
-          <Form.Item name="imageUrl" label="海报URL">
-            <Input
-              addonAfter={
-                <div
-                  className="cursor-pointer"
+          <Form.Item label="海报URL">
+            <Space.Compact style={{ width: '100%' }}>
+              <Form.Item name="imageUrl" noStyle>
+                <Input placeholder="https://..." style={{ flex: 1 }} />
+              </Form.Item>
+              <Tooltip title="搜索海报">
+                <Button
+                  size="small"
+                  icon={<SearchOutlined />}
+                  onClick={() => setPosterSearchVisible(true)}
+                />
+              </Tooltip>
+              <Tooltip title="URL直搜（下载到本地）">
+                <Button
+                  size="small"
+                  icon={<LinkOutlined />}
+                  loading={downloadingLocal}
+                  onClick={async () => {
+                    if (!imageUrl) {
+                      messageApi.warning('请先填写海报URL')
+                      return
+                    }
+                    setDownloadingLocal(true)
+                    try {
+                      const res = await downloadPosterToLocal({
+                        imageUrl,
+                        title: title || '',
+                        season: form.getFieldValue('season') || 1,
+                        year: form.getFieldValue('year') || undefined,
+                      })
+                      if (res?.data?.localImagePath) {
+                        setLocalImagePath(res.data.localImagePath)
+                        messageApi.success('海报已下载到本地')
+                      } else {
+                        messageApi.error('下载失败')
+                      }
+                    } catch (error) {
+                      messageApi.error(`下载失败: ${error?.response?.data?.detail || error.message}`)
+                    } finally {
+                      setDownloadingLocal(false)
+                    }
+                  }}
+                />
+              </Tooltip>
+              <Tooltip title="刷新海报缓存">
+                <Button
+                  size="small"
+                  icon={<MyIcon icon="refresh" size={14} />}
                   onClick={async () => {
                     try {
-                      await refreshPoster({
-                        animeId,
-                        imageUrl: imageUrl,
-                      })
+                      await refreshPoster({ animeId, imageUrl })
                       messageApi.success('海报已刷新并缓存成功！')
                     } catch (error) {
                       messageApi.error(`刷新海报失败: ${error.message}`)
                     }
                   }}
-                >
-                  <MyIcon icon="refresh" size={20} />
-                </div>
-              }
-            />
+                />
+              </Tooltip>
+            </Space.Compact>
           </Form.Item>
           {!!fetchedMetadata?.imageUrl &&
             fetchedMetadata?.imageUrl !== imageUrl && (
@@ -771,6 +1587,24 @@ export const Library = () => {
                 </Button>
               </Form.Item>
             )}
+
+          {/* 本地海报行 */}
+          <Form.Item label="本地海报">
+            <Space style={{ width: '100%' }}>
+              <Input
+                value={localImagePath || '暂无'}
+                readOnly
+                style={{ flex: 1, minWidth: 300, color: localImagePath ? undefined : 'var(--text-tertiary, #999)' }}
+              />
+              <Tooltip title="预览海报">
+                <Button
+                  icon={<EyeOutlined />}
+                  disabled={!localImagePath}
+                  onClick={() => setPreviewVisible(true)}
+                />
+              </Tooltip>
+            </Space>
+          </Form.Item>
 
           <Form.Item name="tmdbId" label="TMDB ID">
             <Input.Search
@@ -804,14 +1638,76 @@ export const Library = () => {
           </Form.Item>
           <Form.Item name="tmdbEpisodeGroupId" label="剧集组ID">
             <Input.Search
-              placeholder="TMDB Episode Group Id"
+              placeholder="剧集组ID / URL / 本地路径(.json)"
               allowClear
               enterButton="搜索"
               loading={searchEgidLoading}
+              prefix={egidValue?.startsWith?.('local-') ? <Tag color="green" className="mr-0">本地</Tag> : null}
               onSearch={() => {
                 onEgidSearch()
               }}
-              disabled={type === DANDAN_TYPE_MAPPING.movie || !tmdbId}
+              suffix={
+                <Dropdown
+                  menu={{
+                    items: [
+                      {
+                        key: 'id-search',
+                        label: '剧集组ID直搜',
+                        onClick: async () => {
+                          const egidValue = form.getFieldValue('tmdbEpisodeGroupId')?.trim()
+                          if (!egidValue) {
+                            messageApi.warning('请先输入剧集组ID')
+                            return
+                          }
+                          try {
+                            setSearchEgidLoading(true)
+                            const res = await getAllEpisode({ tmdbId: tmdbId, egid: egidValue })
+                            if (res?.data?.id) {
+                              setAllEpisode(res.data)
+                              setEpisodeOpen(true)
+                            } else {
+                              messageApi.error('没有找到该剧集组的分集信息')
+                            }
+                          } catch (error) {
+                            messageApi.error(`搜索失败: ${error?.response?.data?.detail || error.message}`)
+                          } finally {
+                            setSearchEgidLoading(false)
+                          }
+                        },
+                      },
+                      {
+                        key: 'local-json',
+                        label: '查询本地JSON',
+                        onClick: () => {
+                          setLocalPathOpen(true)
+                        },
+                      },
+                      {
+                        key: 'paste-json',
+                        label: '粘贴JSON',
+                        onClick: () => {
+                          setPasteJsonOpen(true)
+                        },
+                      },
+                      { type: 'divider' },
+                      {
+                        key: 'edit-eg',
+                        label: '查看/编辑剧集组',
+                        onClick: () => {
+                          handleOpenEditEg()
+                        },
+                      },
+                    ],
+                  }}
+                  trigger={['click']}
+                  placement="bottomRight"
+                >
+                  <MenuOutlined
+                    className="cursor-pointer opacity-60 transition-all hover:opacity-100"
+                    style={{ fontSize: 14 }}
+                  />
+                </Dropdown>
+              }
             />
           </Form.Item>
           <Form.Item name="bangumiId" label="BGM ID">
@@ -970,6 +1866,20 @@ export const Library = () => {
             fetchedValue={fetchedMetadata?.aliasesCn?.[2]}
             form={form}
           />
+          <Form.Item
+            name="aliasLocked"
+            label={
+              <Space>
+                <span>锁定别名</span>
+                <Tooltip title="锁定后,TMDB自动刮削任务将不会自动更新此作品的别名信息">
+                  <QuestionCircleOutlined />
+                </Tooltip>
+              </Space>
+            }
+            valuePropName="checked"
+          >
+            <Switch />
+          </Form.Item>
           <Form.Item name="animeId" hidden>
             <Input />
           </Form.Item>
@@ -1223,11 +2133,16 @@ export const Library = () => {
                   {item.name} (Order: {item.order})
                 </div>
                 {item.episodes?.map((ep, i) => {
+                  // 计算绝对集数显示格式
+                  // 特别季(season_number=0): S00EXX
+                  // 正片(season_number=1): S01EXX (使用episode_number作为绝对序号)
+                  const seasonNum = ep.season_number || ep.seasonNumber || 0
+                  const episodeNum = ep.episode_number || ep.episodeNumber || (ep.order + 1)
+                  const absoluteDisplay = `S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`
+
                   return (
                     <div key={i}>
-                      第{ep.order + 1}集（绝对：S
-                      {padStart(ep.seasonNumber, 2, '0')}E
-                      {padStart(ep.episodeNumber, 2, '0')}）|
+                      第{ep.order + 1}集（绝对：{absoluteDisplay}）|
                       {ep.name || '无标题'}
                     </div>
                   )
@@ -1349,6 +2264,328 @@ export const Library = () => {
           }}
         />
       </Modal>
+      {/* 源选择弹窗 */}
+      <Modal
+        title={`${sourceSelectAction === 'favorite' ? '选择要标记的源' : '选择要追更的源'} - ${sourceSelectTitle}`}
+        open={sourceSelectOpen}
+        onOk={handleSourceSelectConfirm}
+        onCancel={() => setSourceSelectOpen(false)}
+        okText="确认"
+        cancelText="取消"
+        zIndex={110}
+      >
+        <div className="py-4">
+          <Radio.Group
+            value={selectedSourceId}
+            onChange={(e) => setSelectedSourceId(e.target.value)}
+            className="w-full"
+          >
+            <Space direction="vertical" className="w-full">
+              {sourceSelectSources.map((source) => (
+                <Radio key={source.sourceId} value={source.sourceId} className="w-full">
+                  <div className="flex items-center gap-2">
+                    <span className="font-medium">{source.providerName}</span>
+                    {source.isFavorited && (
+                      <Tag color="gold" className="ml-2">已标记</Tag>
+                    )}
+                    {source.incrementalRefreshEnabled && (
+                      <Tag color="green" className="ml-2">追更中</Tag>
+                    )}
+                  </div>
+                </Radio>
+              ))}
+            </Space>
+          </Radio.Group>
+          <div className="mt-4 text-gray-500 text-sm">
+            {sourceSelectAction === 'favorite'
+              ? '提示：每个作品只能有一个标记的源，选择后其他源的标记会被取消。'
+              : '提示：每个作品只能有一个追更的源，选择后其他源的追更会被取消。'
+            }
+          </div>
+        </div>
+      </Modal>
+      {/* 本地剧集组预览 Modal */}
+      <Modal
+        title="本地剧集组预览"
+        open={localEgOpen}
+        footer={null}
+        zIndex={110}
+        onCancel={() => {
+          setLocalEgOpen(false)
+          setLocalEgParsedData(null)
+        }}
+        width={600}
+      >
+        {localEgParsedData && (
+          <div>
+            <Card size="small" title={
+              <span>
+                共 {localEgParsedData.groups?.length || 0} 组，
+                {localEgParsedData.groups?.reduce((sum, g) => sum + (g.episodes?.length || 0), 0)} 集
+              </span>
+            }>
+              {localEgParsedData.description && (
+                <Typography.Paragraph type="secondary" ellipsis={{ rows: 2, expandable: true }}>
+                  {localEgParsedData.description}
+                </Typography.Paragraph>
+              )}
+              <Collapse
+                size="small"
+                items={localEgParsedData.groups?.map((g, i) => ({
+                  key: i,
+                  label: `${g.name || `组 ${i + 1}`} (${g.episodes?.length || 0} 集)`,
+                  children: (
+                    <div className="max-h-40 overflow-y-auto text-sm">
+                      {g.episodes?.map((ep, j) => (
+                        <div key={j}>
+                          S{String(ep.season_number ?? 0).padStart(2, '0')}
+                          E{String(ep.episode_number ?? 0).padStart(2, '0')}
+                          {' → '}Order: {ep.order}
+                        </div>
+                      ))}
+                    </div>
+                  ),
+                }))}
+              />
+            </Card>
+            <Button
+              type="primary"
+              className="mt-3 w-full"
+              loading={localEgApplyLoading}
+              onClick={handleLocalEgApply}
+            >
+              应用此剧集组
+            </Button>
+          </div>
+        )}
+      </Modal>
+      {/* 查询本地JSON路径 Modal */}
+      <Modal
+        title="查询服务端剧集组 JSON"
+        open={localPathOpen}
+        onOk={handleLocalPathConfirm}
+        confirmLoading={localPathLoading}
+        okText="获取"
+        cancelText="取消"
+        zIndex={110}
+        onCancel={() => {
+          setLocalPathOpen(false)
+          setLocalPathValue('')
+        }}
+      >
+        <div className="text-gray-500 text-sm mb-3">
+          输入弹幕库服务端的本地文件路径或网络URL，服务端将读取并解析 JSON 文件。
+        </div>
+        <Space.Compact style={{ width: '100%' }}>
+          <Input
+            placeholder="例如：/path/to/episodegroup.json 或 https://..."
+            value={localPathValue}
+            onChange={(e) => setLocalPathValue(e.target.value)}
+            onPressEnter={handleLocalPathConfirm}
+          />
+          <Button
+            icon={<FolderOpenOutlined />}
+            onClick={() => setFileBrowserOpen(true)}
+            title="浏览服务端文件"
+          />
+        </Space.Compact>
+      </Modal>
+      {/* 服务端文件浏览器（选择JSON文件） */}
+      <DirectoryBrowser
+        visible={fileBrowserOpen}
+        onClose={() => setFileBrowserOpen(false)}
+        onSelect={(path) => {
+          setLocalPathValue(path)
+          setFileBrowserOpen(false)
+        }}
+        selectMode="file"
+        fileFilter=".json"
+      />
+      {/* 粘贴JSON Modal */}
+      <Modal
+        title="粘贴剧集组 JSON"
+        open={pasteJsonOpen}
+        onOk={handlePasteJsonConfirm}
+        okText="确认"
+        cancelText="取消"
+        zIndex={110}
+        onCancel={() => {
+          setPasteJsonOpen(false)
+          setPasteJsonValue('')
+        }}
+      >
+        <Input.TextArea
+          rows={12}
+          placeholder='请粘贴 StrmAssistant 格式的剧集组 JSON，需包含 "groups" 数组'
+          value={pasteJsonValue}
+          onChange={(e) => setPasteJsonValue(e.target.value)}
+        />
+      </Modal>
+      {/* 查看/编辑剧集组 Modal */}
+      <Modal
+        title={`查看/编辑剧集组 ${editEgData?.id || ''}`}
+        open={editEgOpen}
+        width={700}
+        zIndex={110}
+        onCancel={() => { setEditEgOpen(false); setEditEgData(null) }}
+        footer={
+          <div className="flex justify-end gap-2">
+            <Button onClick={() => { setEditEgOpen(false); setEditEgData(null) }}>取消</Button>
+            <Button type="primary" loading={editEgSaving} onClick={handleSaveEditEg}>
+              保存修改
+            </Button>
+          </div>
+        }
+      >
+        {editEgData && (
+          <div className="max-h-[60vh] overflow-y-auto">
+            <div className="flex gap-3 mb-4">
+              <div className="flex-1">
+                <div className="text-xs text-gray-500 mb-1">剧集组名称</div>
+                <Input
+                  value={editEgData.name}
+                  onChange={e => updateEditEgField(['name'], e.target.value)}
+                  placeholder="剧集组名称"
+                />
+              </div>
+              <div className="flex-1">
+                <div className="text-xs text-gray-500 mb-1">描述</div>
+                <Input
+                  value={editEgData.description}
+                  onChange={e => updateEditEgField(['description'], e.target.value)}
+                  placeholder="描述"
+                />
+              </div>
+            </div>
+            <Collapse
+              size="small"
+              defaultActiveKey={editEgData.groups.map((_, i) => i)}
+              items={editEgData.groups.map((group, gi) => ({
+                key: gi,
+                label: (
+                  <div className="flex items-center gap-2 w-full">
+                    <span className="font-bold">{group.name || `组 ${gi + 1}`}</span>
+                    <Tag>{group.episodes.length} 集</Tag>
+                    <span className="text-xs text-gray-400">Order: {group.order}</span>
+                  </div>
+                ),
+                extra: (
+                  <Button
+                    type="text" danger size="small"
+                    onClick={e => { e.stopPropagation(); removeEgGroup(gi) }}
+                  >
+                    删除组
+                  </Button>
+                ),
+                children: (
+                  <div>
+                    <div className="flex gap-2 mb-2">
+                      <Input
+                        size="small" placeholder="组名"
+                        value={group.name}
+                        onChange={e => updateEditEgField(['groups', gi, 'name'], e.target.value)}
+                        style={{ width: 150 }}
+                      />
+                      <InputNumber
+                        size="small" placeholder="Order"
+                        value={group.order} min={0}
+                        onChange={v => updateEditEgField(['groups', gi, 'order'], v ?? 0)}
+                        style={{ width: 90 }}
+                      />
+                    </div>
+                    <Table
+                      size="small" pagination={false}
+                      dataSource={group.episodes}
+                      rowKey={(_, i) => i}
+                      columns={[
+                        {
+                          title: '季', dataIndex: 'seasonNumber', width: 70,
+                          render: (v, _, ei) => (
+                            <InputNumber size="small" value={v} min={0}
+                              onChange={val => updateEditEgField(['groups', gi, 'episodes', ei, 'seasonNumber'], val ?? 0)}
+                              style={{ width: '100%' }}
+                            />
+                          ),
+                        },
+                        {
+                          title: '集', dataIndex: 'episodeNumber', width: 70,
+                          render: (v, _, ei) => (
+                            <InputNumber size="small" value={v} min={0}
+                              onChange={val => updateEditEgField(['groups', gi, 'episodes', ei, 'episodeNumber'], val ?? 0)}
+                              style={{ width: '100%' }}
+                            />
+                          ),
+                        },
+                        {
+                          title: '顺序', dataIndex: 'order', width: 70,
+                          render: (v, _, ei) => (
+                            <InputNumber size="small" value={v} min={0}
+                              onChange={val => updateEditEgField(['groups', gi, 'episodes', ei, 'order'], val ?? 0)}
+                              style={{ width: '100%' }}
+                            />
+                          ),
+                        },
+                        {
+                          title: '标题', dataIndex: 'name',
+                          render: (v, _, ei) => (
+                            <Input size="small" value={v}
+                              onChange={e => updateEditEgField(['groups', gi, 'episodes', ei, 'name'], e.target.value)}
+                            />
+                          ),
+                        },
+                        {
+                          title: '', width: 50,
+                          render: (_, __, ei) => (
+                            <Button type="text" danger size="small"
+                              onClick={() => removeEgEpisode(gi, ei)}
+                            >
+                              删除
+                            </Button>
+                          ),
+                        },
+                      ]}
+                    />
+                    <Button size="small" type="dashed" className="mt-2 w-full"
+                      onClick={() => addEgEpisode(gi)}
+                    >
+                      + 添加分集
+                    </Button>
+                  </div>
+                ),
+              }))}
+            />
+            <Button type="dashed" className="mt-3 w-full" onClick={addEgGroup}>
+              + 添加组
+            </Button>
+          </div>
+        )}
+      </Modal>
+
+      {/* 海报搜索弹窗 */}
+      <PosterSearchModal
+        visible={posterSearchVisible}
+        onClose={() => setPosterSearchVisible(false)}
+        onSelect={(posterUrl) => {
+          form.setFieldsValue({ imageUrl: posterUrl })
+          messageApi.success('已填入海报URL')
+        }}
+        defaultKeyword={title || ''}
+        tmdbId={tmdbId}
+        tvdbId={tvdbId}
+        mediaType={type === 'movie' ? 'movie' : 'tv'}
+      />
+
+      {/* 本地海报预览 */}
+      {previewVisible && localImagePath && (
+        <Image
+          style={{ display: 'none' }}
+          preview={{
+            visible: previewVisible,
+            src: localImagePath,
+            onVisibleChange: (vis) => setPreviewVisible(vis),
+          }}
+        />
+      )}
     </div>
   )
 }

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Callable, Optional
 from datetime import timedelta
@@ -7,12 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy import text, select
 
-from .. import crud, orm_models
-from ..config import settings
-from ..timezone import get_now
+from src.db import crud, orm_models, _get_db_url
+from src.core import settings, get_now
 from .base import BaseJob
-from ..task_manager import TaskSuccess
-from ..database import _get_db_url
+from src.services import TaskSuccess
 
 logger = logging.getLogger(__name__)
 
@@ -57,30 +56,32 @@ async def _clean_orphaned_images(session: AsyncSession) -> str:
     return f"图片缓存清理完成，删除了 {deleted_count} 个孤立文件。"
 
 async def _optimize_database(session: AsyncSession, db_type: str) -> str:
-    """根据数据库类型执行表优化。"""
-    tables_to_optimize = ["comment", "task_history", "token_access_logs", "external_api_logs"]
-    
-    if db_type == "mysql":
-        logger.info("检测到 MySQL，正在执行 OPTIMIZE TABLE...")
-        await session.execute(text(f"OPTIMIZE TABLE {', '.join(tables_to_optimize)};"))
-        # 提交由调用方（任务）处理
-        return "OPTIMIZE TABLE 执行成功。"
-    
-    elif db_type == "postgresql":
+    """根据数据库类型执行表优化（PostgreSQL VACUUM，MySQL InnoDB 无需手动 OPTIMIZE）。"""
+    if db_type == "postgresql":
         logger.info("检测到 PostgreSQL，正在执行 VACUUM...")
-        # VACUUM 不能在事务块内运行。我们创建一个具有自动提交功能的新引擎来执行此特定操作。
         db_url_obj = _get_db_url()
-        engine_args = {
-            "isolation_level": "AUTOCOMMIT",
-        }
-        auto_commit_engine = create_async_engine(db_url_obj, **engine_args)
+        auto_commit_engine = create_async_engine(db_url_obj, isolation_level="AUTOCOMMIT")
         try:
             async with auto_commit_engine.connect() as connection:
                 await connection.execute(text("VACUUM;"))
             return "VACUUM 执行成功。"
         finally:
             await auto_commit_engine.dispose()
-            
+    elif db_type == "mysql":
+        # InnoDB 的 OPTIMIZE TABLE 会全表重建，大表上耗时极长且锁 I/O，不适合定时任务。
+        # 改为 ANALYZE TABLE：仅更新索引统计信息，不锁表、不重建，几毫秒完成。
+        # 在 prune_logs 批量 DELETE 后执行，确保查询优化器使用最新统计。
+        tables_to_analyze = ["task_history", "token_access_log", "external_api_logs"]
+        analyzed = []
+        for table in tables_to_analyze:
+            try:
+                await session.execute(text(f"ANALYZE TABLE `{table}`"))
+                analyzed.append(table)
+            except Exception as e:
+                logger.warning(f"ANALYZE TABLE `{table}` 失败: {e}")
+        if analyzed:
+            return f"MySQL ANALYZE TABLE 完成: {', '.join(analyzed)}。"
+        return "MySQL ANALYZE TABLE: 无可分析的表。"
     else:
         message = f"不支持的数据库类型 '{db_type}'，跳过优化。"
         logger.warning(message)
@@ -135,11 +136,15 @@ class DatabaseMaintenanceJob(BaseJob):
             total_deleted = 0
             for name, (model, date_column) in tables_to_prune.items():
                 deleted_count: Optional[int] = await crud.prune_logs(session, model, date_column, cutoff_date)
-                
+
                 # 修正：增加对 deleted_count 的 None 值检查，以提高代码的健壮性。
                 # 这可以防止当底层数据库操作（如某些驱动下的DELETE）不返回行数时，任务意外失败。
                 if deleted_count is None:
                     deleted_count = 0
+
+                # 关键修复：每个表 DELETE 后立即 commit，释放行锁。
+                # 避免批量 DELETE task_history 的行锁长时间持有，阻塞其他任务的进度更新和新任务创建。
+                await session.commit()
 
                 if deleted_count > 0:
                     self.logger.info(f"从 {name} 表中删除了 {deleted_count} 条旧记录。")
@@ -188,8 +193,13 @@ class DatabaseMaintenanceJob(BaseJob):
         await progress_callback(70, "正在执行数据库表优化...")
         
         try:
-            optimization_message = await _optimize_database(session, db_type)
+            optimization_message = await asyncio.wait_for(
+                _optimize_database(session, db_type), timeout=300  # 5 分钟超时
+            )
             self.logger.info(f"数据库优化结果: {optimization_message}")
+        except asyncio.TimeoutError:
+            optimization_message = "数据库优化超时(5分钟)，已跳过"
+            self.logger.warning(optimization_message)
         except Exception as e:
             optimization_message = f"数据库优化失败: {e}"
             self.logger.error(optimization_message, exc_info=True)
@@ -197,16 +207,39 @@ class DatabaseMaintenanceJob(BaseJob):
 
         await progress_callback(80, optimization_message)
 
-        # --- 4. 图片缓存清理 ---
+        # --- 4. 图片缓存清理（带重试，防止长时间任务导致连接断开）---
         await progress_callback(85, "正在清理无效图片缓存...")
 
-        try:
-            image_cleanup_message = await _clean_orphaned_images(session)
-            self.logger.info(f"图片缓存清理结果: {image_cleanup_message}")
-        except Exception as e:
-            image_cleanup_message = f"图片缓存清理失败: {e}"
-            self.logger.error(image_cleanup_message, exc_info=True)
-            # 即使清理失败，也不应导致整个任务失败，仅记录错误
+        image_cleanup_message = ""
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                image_cleanup_message = await asyncio.wait_for(
+                    _clean_orphaned_images(session), timeout=180  # 3 分钟超时
+                )
+                self.logger.info(f"图片缓存清理结果: {image_cleanup_message}")
+                break
+            except asyncio.TimeoutError:
+                image_cleanup_message = "图片缓存清理超时(3分钟)，已跳过"
+                self.logger.warning(image_cleanup_message)
+                break
+            except OperationalError as e:
+                if attempt < max_retries:
+                    wait_time = 3 * (attempt + 1)
+                    self.logger.warning(f"图片缓存清理数据库连接异常 (第{attempt + 1}次)，{wait_time}秒后重试: {e}")
+                    await asyncio.sleep(wait_time)
+                    # 尝试使连接池回收死连接（通过 pool_pre_ping 机制）
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        pass
+                else:
+                    image_cleanup_message = f"图片缓存清理失败（重试{max_retries}次后仍失败）: {e}"
+                    self.logger.error(image_cleanup_message, exc_info=True)
+            except Exception as e:
+                image_cleanup_message = f"图片缓存清理失败: {e}"
+                self.logger.error(image_cleanup_message, exc_info=True)
+                break
 
         await progress_callback(100, "缓存日志清理任务完成")
 

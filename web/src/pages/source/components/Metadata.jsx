@@ -1,17 +1,24 @@
 import {
-  Button,
   Card,
   Form,
-  Input,
   List,
-  message,
   Modal,
   Switch,
   Tag,
   Tooltip,
+  Tabs,
 } from 'antd'
 import { useEffect, useState, useRef } from 'react'
-import { getMetaData, getProviderConfig, setMetaData, setProviderConfig } from '../../../apis'
+import {
+  getMetaData,
+  getProviderConfig,
+  setMetaData,
+  setProviderConfig,
+  setBangumiConfig,
+  setTmdbConfig,
+  setTvdbConfig,
+  setDoubanConfig,
+} from '../../../apis'
 import { MyIcon } from '@/components/MyIcon'
 import {
   closestCorners,
@@ -28,8 +35,37 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
-import { ContainerOutlined } from '@ant-design/icons'
+import {
+  CheckCircleFilled,
+  CloseCircleFilled,
+  QuestionCircleFilled,
+  ExclamationCircleFilled,
+  MinusCircleFilled,
+} from '@ant-design/icons'
 import { useMessage } from '../../../MessageContext'
+import {
+  BangumiConfig,
+  TMDBConfig,
+  TVDBConfig,
+  DoubanConfig,
+  ImdbConfig
+} from './MetadataSourceConfig'
+
+const getStatusIcon = (statusCode) => {
+  switch (statusCode) {
+    case 'ok':
+      return <CheckCircleFilled style={{ color: 'var(--color-green-400)', fontSize: 16 }} />
+    case 'warning':
+      return <ExclamationCircleFilled style={{ color: 'var(--color-orange-400)', fontSize: 16 }} />
+    case 'error':
+      return <CloseCircleFilled style={{ color: 'var(--color-red-400)', fontSize: 16 }} />
+    case 'disabled':
+      return <MinusCircleFilled style={{ color: 'var(--color-gray-400)', fontSize: 16 }} />
+    case 'unconfigured':
+    default:
+      return <QuestionCircleFilled style={{ color: 'var(--color-gray-400)', fontSize: 16 }} />
+  }
+}
 
 const SortableItem = ({ item, index, handleChangeStatus, onConfig }) => {
   const {
@@ -70,21 +106,14 @@ const SortableItem = ({ item, index, handleChangeStatus, onConfig }) => {
           <div>{item.providerName}</div>
         </div>
         <div className="flex items-center justify-around gap-3">
-          {/* 新增：配置按钮 */}
+          {/* 状态图标：移到齿轮左边，hover 显示详细状态 */}
+          <Tooltip title={item.status || '未配置'} trigger={['click', 'hover']}>
+            <span className="cursor-default">{getStatusIcon(item.statusCode)}</span>
+          </Tooltip>
+          {/* 配置按钮 */}
           <div onClick={onConfig} className="cursor-pointer">
             <MyIcon icon="setting" size={24} />
           </div>
-          {item.status !== '未配置' && (
-            <Tooltip title={item.status} trigger={['click', 'hover']}>
-              <ContainerOutlined
-                style={{
-                  color: item.status?.includes('失败')
-                    ? 'var(--color-red-400)'
-                    : 'var(--color-green-400)',
-                }}
-              />
-            </Tooltip>
-          )}
           {item.isAuxSearchEnabled ? (
             <Tag color="green">已启用</Tag>
           ) : (
@@ -114,6 +143,7 @@ export const Metadata = () => {
   const [selectedSource, setSelectedSource] = useState(null)
   const [form] = Form.useForm()
   const [confirmLoading, setConfirmLoading] = useState(false)
+  const [configData, setConfigData] = useState(null)
 
   const messageApi = useMessage()
 
@@ -148,13 +178,23 @@ export const Metadata = () => {
     if (isModalOpen && selectedSource?.providerName) {
       // 重置表单以防显示旧数据
       form.resetFields()
+      setConfigData(null)
       getProviderConfig({ providerName: selectedSource.providerName })
         .then(res => {
-          form.setFieldsValue({
+          setConfigData(res.data)
+          const formValues = {
             ...res.data,
             useProxy: res.data.useProxy ?? true,
             logRawResponses: res.data.logRawResponses ?? false,
-          })
+          }
+
+          // IMDB特定配置
+          if (selectedSource.providerName === 'imdb') {
+            formValues.imdbUseApi = res.data.imdbUseApi ?? true
+            formValues.imdbEnableFallback = res.data.imdbEnableFallback ?? true
+          }
+
+          form.setFieldsValue(formValues)
         })
         .catch(() => {
           messageApi.error('获取配置失败')
@@ -240,9 +280,54 @@ export const Metadata = () => {
     try {
       setConfirmLoading(true)
       const values = await form.validateFields()
+
+      // 收集动态字段（来自 configurableFields）
+      const dynamicPayload = {}
+      if (configData?.configurableFields) {
+        for (const key of Object.keys(configData.configurableFields)) {
+          if (values[key] !== undefined) {
+            dynamicPayload[key] = values[key]
+          }
+        }
+      }
+
+      // 保存通用配置 + 动态字段（一次请求）
       await setProviderConfig(selectedSource.providerName, {
-        ...values,
+        useProxy: values.useProxy,
+        logRawResponses: values.logRawResponses,
+        ...dynamicPayload,
       })
+
+      // 保存源特定配置
+      const providerName = selectedSource.providerName
+      if (providerName === 'bangumi') {
+        await setBangumiConfig({
+          bangumiToken: values.bangumiToken,
+          bangumiClientId: values.bangumiClientId,
+          bangumiClientSecret: values.bangumiClientSecret,
+          authMode: values.authMode || 'token', // 保存认证模式
+        })
+      } else if (providerName === 'tmdb') {
+        await setTmdbConfig({
+          tmdbApiKey: values.tmdbApiKey,
+          tmdbApiBaseUrl: values.tmdbApiBaseUrl,
+          tmdbImageBaseUrl: values.tmdbImageBaseUrl,
+        })
+      } else if (providerName === 'tvdb') {
+        await setTvdbConfig({
+          tvdbApiKey: values.tvdbApiKey,
+        })
+      } else if (providerName === 'douban') {
+        await setDoubanConfig({
+          doubanCookie: values.doubanCookie,
+        })
+      } else if (providerName === 'imdb') {
+        await setProviderConfig(providerName, {
+          imdbUseApi: values.imdbUseApi ?? true,
+          imdbEnableFallback: values.imdbEnableFallback ?? true,
+        })
+      }
+
       messageApi.success('保存成功')
       setIsModalOpen(false)
       // 成功后刷新列表以更新状态
@@ -271,17 +356,10 @@ export const Metadata = () => {
               <div>{activeItem.providerName}</div>
             </div>
             <div className="flex items-center justify-around gap-4">
-              {activeItem.status !== '未配置' && (
-                <Tooltip title={activeItem.status}>
-                  <ContainerOutlined
-                    style={{
-                      color: activeItem.status?.includes('失败')
-                        ? 'var(--color-red-400)'
-                        : 'var(--color-green-400)',
-                    }}
-                  />
-                </Tooltip>
-              )}
+              {/* 状态图标：移到齿轮左边，hover 显示详细状态 */}
+              <Tooltip title={activeItem.status || '未配置'}>
+                <span className="cursor-default">{getStatusIcon(activeItem.statusCode)}</span>
+              </Tooltip>
               {activeItem.isAuxSearchEnabled ? (
                 <Tag color="green">已启用</Tag>
               ) : (
@@ -345,61 +423,102 @@ export const Metadata = () => {
         confirmLoading={confirmLoading}
         destroyOnClose
         forceRender
+        width={700}
       >
         <Form
           form={form}
           layout="vertical"
           initialValues={{ useProxy: true, logRawResponses: false }}
         >
-          <div className="my-4">
-            请为 {selectedSource?.providerName} 源填写以下配置信息。
-          </div>
-          <div className="flex items-center justify-start flex-wrap gap-2 mb-4">
-            <Form.Item
-              name="useProxy"
-              label="启用代理"
-              valuePropName="checked"
-              className="min-w-[100px] shrink-0 !mb-0"
-            >
-              <Switch />
-            </Form.Item>
-            <div className="w-full text-gray-500">
-              启用后，此源的所有API请求将通过全局代理服务器进行。需要先在设置中配置全局代理。
-            </div>
-          </div>
-          <div className="flex items-center justify-start flex-wrap md:flex-nowrap gap-2 mb-4">
-            <Form.Item
-              name="logRawResponses"
-              label="记录原始响应"
-              valuePropName="checked"
-              className="min-w-[100px] shrink-0 !mb-0"
-            >
-              <Switch />
-            </Form.Item>
-            <div className="w-full text-gray-500">
-              启用后，此源的所有API请求的原始响应将被记录到{' '}
-              <code>config/logs/metadata_responses.log</code> 文件中，用于调试。
-            </div>
-        </div>
-          {/* 修正：根据后端返回的 isFailoverSource 标志来决定是否显示此开关 */}
-          {form.getFieldValue('isFailoverSource') && (
-            <div className="flex items-center justify-start flex-wrap md:flex-nowrap gap-2 mb-4">
-              <Form.Item
-                name="forceAuxSearchEnabled"
-                label="强制辅助搜索"
-                valuePropName="checked"
-                className="min-w-[100px] shrink-0 !mb-0"
-              >
-                <Switch />
-              </Form.Item>
-              <div
-                className="w-full text-gray-500"
-                title="启用后，在搜索时，此源将作为一个补充搜索源。如果其他弹幕源没有找到结果，或结果不佳，此源的结果将作为备选项显示在搜索结果中。"
-              >
-                启用后，此源将作为补充搜索源。当其他弹幕源结果不佳时，其结果将作为备选项显示。
-              </div>
-            </div>
-          )}
+          <Tabs
+            defaultActiveKey="general"
+            items={[
+              {
+                key: 'general',
+                label: '通用配置',
+                children: (
+                  <div className="space-y-4">
+                    <div className="my-4">
+                      请为 {selectedSource?.providerName} 源填写以下配置信息。
+                    </div>
+                    <div className="flex items-center justify-start flex-wrap gap-2 mb-4">
+                      <Form.Item
+                        name="useProxy"
+                        label="启用代理"
+                        valuePropName="checked"
+                        className="min-w-[100px] shrink-0 !mb-0"
+                      >
+                        <Switch />
+                      </Form.Item>
+                      <div className="w-full text-gray-500">
+                        启用后，此源的所有API请求将通过全局代理服务器进行。需要先在设置中配置全局代理。
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-start flex-wrap md:flex-nowrap gap-2 mb-4">
+                      <Form.Item
+                        name="logRawResponses"
+                        label="记录原始响应"
+                        valuePropName="checked"
+                        className="min-w-[100px] shrink-0 !mb-0"
+                      >
+                        <Switch />
+                      </Form.Item>
+                      <div className="w-full text-gray-500">
+                        启用后，此源的所有API请求的原始响应将被记录到{' '}
+                        <code>config/logs/metadata_responses.log</code> 文件中，用于调试。
+                      </div>
+                    </div>
+                  </div>
+                ),
+              },
+              {
+                key: 'source',
+                label: '源配置',
+                children: (
+                  <div className="py-4">
+                    {selectedSource?.providerName === 'bangumi' && <BangumiConfig form={form} />}
+                    {selectedSource?.providerName === 'tmdb' && <TMDBConfig form={form} />}
+                    {selectedSource?.providerName === 'tvdb' && <TVDBConfig form={form} />}
+                    {selectedSource?.providerName === 'douban' && <DoubanConfig form={form} />}
+                    {selectedSource?.providerName === 'imdb' && <ImdbConfig form={form} />}
+                    {/* 动态渲染 configurableFields 声明的字段 */}
+                    {configData?.configurableFields && Object.entries(configData.configurableFields).map(([key, fieldInfo]) => {
+                      // 解析字段配置（兼容元组和对象格式）
+                      const config = Array.isArray(fieldInfo)
+                        ? { label: fieldInfo[0], type: fieldInfo[1] || 'string', tooltip: fieldInfo[2] || '' }
+                        : { type: 'string', tooltip: '', ...fieldInfo }
+
+                      if (config.type === 'boolean') {
+                        return (
+                          <div key={key} className="flex items-center justify-start flex-wrap md:flex-nowrap gap-2 mb-4">
+                            <Form.Item
+                              name={key}
+                              label={config.label}
+                              valuePropName="checked"
+                              className="min-w-[100px] shrink-0 !mb-0"
+                            >
+                              <Switch />
+                            </Form.Item>
+                            {config.tooltip && (
+                              <div className="w-full text-gray-500">{config.tooltip}</div>
+                            )}
+                          </div>
+                        )
+                      }
+                      // 其他类型暂不渲染（未来可扩展）
+                      return null
+                    })}
+                    {!['bangumi', 'tmdb', 'tvdb', 'douban', 'imdb'].includes(selectedSource?.providerName)
+                      && !configData?.configurableFields && (
+                      <div className="text-gray-500 text-center py-8">
+                        此源暂无特定配置项
+                      </div>
+                    )}
+                  </div>
+                ),
+              },
+            ]}
+          />
         </Form>
       </Modal>
     </div>

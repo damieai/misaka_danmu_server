@@ -1,32 +1,34 @@
-import { Card, Form, Switch, Input, Button, Space, Tooltip, Checkbox } from 'antd'
+import { Card, Form, Switch, Input, Button, Space, Tooltip, Checkbox, InputNumber } from 'antd'
 import { useEffect, useState } from 'react'
-import { getMatchFallback, setMatchFallback, getMatchFallbackBlacklist, setMatchFallbackBlacklist, getCustomDanmakuPath, setCustomDanmakuPath, getMatchFallbackTokens, setMatchFallbackTokens, getTokenList, getSearchFallback, setSearchFallback } from '../../../apis'
+import { getMatchFallback, setMatchFallback, getMatchFallbackBlacklist, setMatchFallbackBlacklist, getMatchFallbackTokens, setMatchFallbackTokens, getTokenList, getSearchFallback, setSearchFallback, getConfig, setConfig } from '../../../apis'
 import { useMessage } from '../../../MessageContext'
 import { QuestionCircleOutlined } from '@ant-design/icons'
+import { useAtomValue } from 'jotai'
+import { isMobileAtom } from '../../../../store'
 
 export const MatchFallbackSetting = () => {
   const [form] = Form.useForm()
   const [loading, setLoading] = useState(true)
-  const [pathSaving, setPathSaving] = useState(false)
   const [blacklistSaving, setBlacklistSaving] = useState(false)
   const [tokensSaving, setTokensSaving] = useState(false)
-  const [customPathEnabled, setCustomPathEnabled] = useState(false)
   const [tokenList, setTokenList] = useState([])
   const messageApi = useMessage()
+  const isMobile = useAtomValue(isMobileAtom)
 
   const fetchSettings = async () => {
     try {
       setLoading(true)
-      const [fallbackRes, blacklistRes, pathRes, tokensRes, tokenListRes, searchFallbackRes] = await Promise.all([
+      const [fallbackRes, blacklistRes, tokensRes, tokenListRes, searchFallbackRes, externalApiFallbackRes, preDownloadRes, parallelSearchRes, autoRefreshRes] = await Promise.all([
         getMatchFallback(),
         getMatchFallbackBlacklist(),
-        getCustomDanmakuPath(),
         getMatchFallbackTokens(),
         getTokenList(),
-        getSearchFallback()
+        getSearchFallback(),
+        getConfig('externalApiFallbackEnabled'),
+        getConfig('preDownloadNextEpisodeEnabled'),
+        getConfig('parallelSearchEnabled'),
+        getConfig('danmakuAutoRefreshDays')
       ])
-      const pathEnabled = pathRes.data.enabled === 'true'
-      setCustomPathEnabled(pathEnabled)
       setTokenList(tokenListRes.data || [])
 
       // 解析token配置
@@ -41,9 +43,11 @@ export const MatchFallbackSetting = () => {
         matchFallbackEnabled: fallbackRes.data.value === 'true',
         matchFallbackBlacklist: blacklistRes.data.value || '',
         matchFallbackTokens: selectedTokens,
-        customDanmakuPathEnabled: pathEnabled,
-        customDanmakuPathTemplate: pathRes.data.template,
-        searchFallbackEnabled: searchFallbackRes.data.value === 'true'
+        searchFallbackEnabled: searchFallbackRes.data.value === 'true',
+        externalApiFallbackEnabled: externalApiFallbackRes.data?.value === 'true',
+        preDownloadNextEpisodeEnabled: preDownloadRes.data?.value === 'true',
+        parallelSearchEnabled: parallelSearchRes.data?.value === 'true',
+        danmakuAutoRefreshDays: parseInt(autoRefreshRes.data?.value || '0', 10) || 0
       })
     } catch (error) {
       messageApi.error('获取设置失败')
@@ -78,35 +82,26 @@ export const MatchFallbackSetting = () => {
         await setSearchFallback({ value: String(changedValues.searchFallbackEnabled) })
         messageApi.success('后备搜索开关已保存')
       }
-      if ('customDanmakuPathEnabled' in changedValues) {
-        setCustomPathEnabled(changedValues.customDanmakuPathEnabled)
-        const currentValues = form.getFieldsValue()
-        await setCustomDanmakuPath({
-          enabled: String(changedValues.customDanmakuPathEnabled),
-          template: currentValues.customDanmakuPathTemplate
-        })
-        messageApi.success('自定义路径开关已保存')
+      if ('externalApiFallbackEnabled' in changedValues) {
+        await setConfig('externalApiFallbackEnabled', String(changedValues.externalApiFallbackEnabled))
+        messageApi.success('顺延机制已保存')
+      }
+      if ('preDownloadNextEpisodeEnabled' in changedValues) {
+        await setConfig('preDownloadNextEpisodeEnabled', String(changedValues.preDownloadNextEpisodeEnabled))
+        messageApi.success('预下载设置已保存')
+      }
+      if ('parallelSearchEnabled' in changedValues) {
+        await setConfig('parallelSearchEnabled', String(changedValues.parallelSearchEnabled))
+        messageApi.success('并行搜索设置已保存')
+      }
+      if ('danmakuAutoRefreshDays' in changedValues) {
+        await setConfig('danmakuAutoRefreshDays', String(changedValues.danmakuAutoRefreshDays ?? 0))
+        messageApi.success('弹幕自动刷新设置已保存')
       }
       // 黑名单不自动保存，需要点击保存按钮
     } catch (error) {
       messageApi.error('保存设置失败')
       fetchSettings()
-    }
-  }
-
-  const handlePathSave = async () => {
-    try {
-      setPathSaving(true)
-      const values = form.getFieldsValue()
-      await setCustomDanmakuPath({
-        enabled: String(values.customDanmakuPathEnabled),
-        template: values.customDanmakuPathTemplate
-      })
-      messageApi.success('路径模板已保存')
-    } catch (error) {
-      messageApi.error('保存路径模板失败')
-    } finally {
-      setPathSaving(false)
     }
   }
 
@@ -137,13 +132,6 @@ export const MatchFallbackSetting = () => {
     }
   }
 
-  const handlePathReset = () => {
-    // Docker环境下使用绝对路径，源码环境使用相对路径
-    const defaultTemplate = '/app/config/danmaku/${animeId}/${episodeId}'
-    form.setFieldValue('customDanmakuPathTemplate', defaultTemplate)
-    messageApi.success('已重置为默认路径模板')
-  }
-
   return (
     <Card title="配置" loading={loading}>
       <Form
@@ -153,32 +141,260 @@ export const MatchFallbackSetting = () => {
         initialValues={{
           matchFallbackEnabled: false,
           searchFallbackEnabled: false,
+          externalApiFallbackEnabled: false,
+          preDownloadNextEpisodeEnabled: false,
+          parallelSearchEnabled: false,
+          danmakuAutoRefreshDays: 0,
           matchFallbackBlacklist: '',
-          matchFallbackTokens: [],
-          customDanmakuPathEnabled: false,
-          customDanmakuPathTemplate: '/app/config/danmaku/${animeId}/${episodeId}'
+          matchFallbackTokens: []
         }}
       >
-        <div style={{ display: 'flex', gap: '16px', alignItems: 'flex-start' }}>
-          <Form.Item
-            name="matchFallbackEnabled"
-            label="启用匹配后备"
-            valuePropName="checked"
-            tooltip="启用后，当播放客户端尝试使用match接口时，接口在本地库中找不到任何结果时，系统将自动触发一个后台任务，尝试从全网搜索并导入对应的弹幕。"
-            style={{ flex: 1 }}
-          >
-            <Switch />
-          </Form.Item>
+        <div className={isMobile ? "space-y-4" : ""} style={isMobile ? {} : { display: 'flex', gap: '16px', alignItems: 'flex-start' }}>
+          {isMobile ? (
+            <>
+              <div style={{ display: 'flex', gap: '16px', alignItems: 'flex-start', marginBottom: '16px' }}>
+                <Form.Item
+                  name="matchFallbackEnabled"
+                  label="启用后备匹配"
+                  valuePropName="checked"
+                  tooltip="启用后，当播放客户端尝试使用match接口时，接口在本地库中找不到任何结果时，系统将自动触发一个后台任务，尝试从全网搜索并导入对应的弹幕。"
+                  style={{ flex: 1 }}
+                >
+                  <Switch />
+                </Form.Item>
 
-          <Form.Item
-            name="searchFallbackEnabled"
-            label="启用后备搜索"
-            valuePropName="checked"
-            tooltip="启用后，当使用search/anime接口搜索时，如果本地库中没有结果，系统将自动触发全网搜索并返回搜索结果。用户可以直接选择搜索结果进行下载。"
-            style={{ flex: 1 }}
-          >
-            <Switch />
-          </Form.Item>
+                <Form.Item
+                  name="searchFallbackEnabled"
+                  label="启用后备搜索"
+                  valuePropName="checked"
+                  tooltip="启用后，当使用search/anime接口搜索时，如果本地库中没有结果，系统将自动触发全网搜索并返回搜索结果。用户可以直接选择搜索结果进行下载。"
+                  style={{ flex: 1 }}
+                >
+                  <Switch />
+                </Form.Item>
+              </div>
+
+              <Form.Item
+                noStyle
+                shouldUpdate={(prevValues, currentValues) =>
+                  prevValues.matchFallbackEnabled !== currentValues.matchFallbackEnabled ||
+                  prevValues.searchFallbackEnabled !== currentValues.searchFallbackEnabled
+                }
+              >
+                {({ getFieldValue }) => {
+                  const matchFallbackEnabled = getFieldValue('matchFallbackEnabled')
+                  const searchFallbackEnabled = getFieldValue('searchFallbackEnabled')
+                  const isFallbackDisabled = !matchFallbackEnabled && !searchFallbackEnabled
+
+                  return (
+                    <>
+                      <div style={{ display: 'flex', gap: '16px', alignItems: 'flex-start', marginBottom: '16px' }}>
+                        <Form.Item
+                          name="externalApiFallbackEnabled"
+                          label={
+                            <div className="flex items-center gap-2">
+                              <span>启用顺延机制</span>
+                              <Tooltip title="当选中的源没有有效分集时（如只有预告片被过滤掉），自动尝试下一个候选源，提高导入成功率。关闭此选项时，将使用传统的单源选择模式。">
+                                <QuestionCircleOutlined />
+                              </Tooltip>
+                            </div>
+                          }
+                          valuePropName="checked"
+                          style={{ flex: 1 }}
+                        >
+                          <Switch disabled={isFallbackDisabled} />
+                        </Form.Item>
+
+                        <Form.Item
+                          name="preDownloadNextEpisodeEnabled"
+                          label={
+                            <div className="flex items-center gap-2">
+                              <span>启用预下载</span>
+                              <Tooltip title="启用后，当播放当前集时，系统会自动在后台下载下一集的弹幕（如果下一集存在且没有弹幕）。需要启用匹配后备或后备搜索。">
+                                <QuestionCircleOutlined />
+                              </Tooltip>
+                            </div>
+                          }
+                          valuePropName="checked"
+                          style={{ flex: 1 }}
+                        >
+                          <Switch disabled={isFallbackDisabled} />
+                        </Form.Item>
+                      </div>
+
+                      <div style={{ display: 'flex', gap: '16px', alignItems: 'flex-start' }}>
+                        <Form.Item
+                          name="parallelSearchEnabled"
+                          label={
+                            <div className="flex items-center gap-2">
+                              <span>启用并行搜索</span>
+                              <Tooltip title="启用后，搜索弹幕时会同时检索本地库和在线源站，将库内已有的分集和源站补充的分集合并为完整列表返回。例如库内只有1-5集，源站有25集，搜索结果将展示完整的1-25集。需要启用后备搜索。">
+                                <QuestionCircleOutlined />
+                              </Tooltip>
+                            </div>
+                          }
+                          valuePropName="checked"
+                          style={{ flex: 1 }}
+                        >
+                          <Switch disabled={isFallbackDisabled} />
+                        </Form.Item>
+                      </div>
+
+                      <div style={{ display: 'flex', gap: '16px', alignItems: 'flex-start' }}>
+                        <Form.Item
+                          name="danmakuAutoRefreshDays"
+                          label={
+                            <div className="flex items-center gap-2">
+                              <span>弹幕自动刷新间隔（天）</span>
+                              <Tooltip title="当播放客户端请求弹幕时，若距上次获取超过设定天数，将自动触发弹幕刷新。设为 0 则禁用此功能。">
+                                <QuestionCircleOutlined />
+                              </Tooltip>
+                            </div>
+                          }
+                          style={{ flex: 1 }}
+                        >
+                          <InputNumber min={0} max={365} precision={0} style={{ width: '100%' }} placeholder="0（禁用）" />
+                        </Form.Item>
+                      </div>
+                    </>
+                  )
+                }}
+              </Form.Item>
+            </>
+          ) : (
+            <>
+              <Form.Item
+                name="matchFallbackEnabled"
+                label="启用匹配后备"
+                valuePropName="checked"
+                tooltip="启用后，当播放客户端尝试使用match接口时，接口在本地库中找不到任何结果时，系统将自动触发一个后台任务，尝试从全网搜索并导入对应的弹幕。"
+                style={isMobile ? {} : { flex: 1 }}
+              >
+                <Switch />
+              </Form.Item>
+
+              <Form.Item
+                name="searchFallbackEnabled"
+                label="启用后备搜索"
+                valuePropName="checked"
+                tooltip="启用后，当使用search/anime接口搜索时，如果本地库中没有结果，系统将自动触发全网搜索并返回搜索结果。用户可以直接选择搜索结果进行下载。"
+                style={isMobile ? {} : { flex: 1 }}
+              >
+                <Switch />
+              </Form.Item>
+
+              <Form.Item
+                noStyle
+                shouldUpdate={(prevValues, currentValues) =>
+                  prevValues.matchFallbackEnabled !== currentValues.matchFallbackEnabled ||
+                  prevValues.searchFallbackEnabled !== currentValues.searchFallbackEnabled
+                }
+              >
+                {({ getFieldValue }) => {
+                  const matchFallbackEnabled = getFieldValue('matchFallbackEnabled')
+                  const searchFallbackEnabled = getFieldValue('searchFallbackEnabled')
+                  const isFallbackDisabled = !matchFallbackEnabled && !searchFallbackEnabled
+
+                  return (
+                    <Form.Item
+                      name="externalApiFallbackEnabled"
+                      label={
+                        <div className="flex items-center gap-2">
+                          <span>启用顺延机制</span>
+                          <Tooltip title="当选中的源没有有效分集时（如只有预告片被过滤掉），自动尝试下一个候选源，提高导入成功率。关闭此选项时，将使用传统的单源选择模式。">
+                            <QuestionCircleOutlined />
+                          </Tooltip>
+                        </div>
+                      }
+                      valuePropName="checked"
+                      style={isMobile ? {} : { flex: 1 }}
+                    >
+                      <Switch disabled={isFallbackDisabled} />
+                    </Form.Item>
+                  )
+                }}
+              </Form.Item>
+
+              <Form.Item
+                noStyle
+                shouldUpdate={(prevValues, currentValues) =>
+                  prevValues.matchFallbackEnabled !== currentValues.matchFallbackEnabled ||
+                  prevValues.searchFallbackEnabled !== currentValues.searchFallbackEnabled
+                }
+              >
+                {({ getFieldValue }) => {
+                  const matchFallbackEnabled = getFieldValue('matchFallbackEnabled')
+                  const searchFallbackEnabled = getFieldValue('searchFallbackEnabled')
+                  const isFallbackDisabled = !matchFallbackEnabled && !searchFallbackEnabled
+
+                  return (
+                    <Form.Item
+                      name="preDownloadNextEpisodeEnabled"
+                      label={
+                        <div className="flex items-center gap-2">
+                          <span>启用预下载</span>
+                          <Tooltip title="启用后，当播放当前集时，系统会自动在后台下载下一集的弹幕（如果下一集存在且没有弹幕）。需要启用匹配后备或后备搜索。">
+                            <QuestionCircleOutlined />
+                          </Tooltip>
+                        </div>
+                      }
+                      valuePropName="checked"
+                      style={isMobile ? {} : { flex: 1 }}
+                    >
+                      <Switch disabled={isFallbackDisabled} />
+                    </Form.Item>
+                  )
+                }}
+              </Form.Item>
+
+              <Form.Item
+                noStyle
+                shouldUpdate={(prevValues, currentValues) =>
+                  prevValues.matchFallbackEnabled !== currentValues.matchFallbackEnabled ||
+                  prevValues.searchFallbackEnabled !== currentValues.searchFallbackEnabled
+                }
+              >
+                {({ getFieldValue }) => {
+                  const matchFallbackEnabled = getFieldValue('matchFallbackEnabled')
+                  const searchFallbackEnabled = getFieldValue('searchFallbackEnabled')
+                  const isFallbackDisabled = !matchFallbackEnabled && !searchFallbackEnabled
+
+                  return (
+                    <Form.Item
+                      name="parallelSearchEnabled"
+                      label={
+                        <div className="flex items-center gap-2">
+                          <span>启用并行搜索</span>
+                          <Tooltip title="启用后，搜索弹幕时会同时检索本地库和在线源站，将库内已有的分集和源站补充的分集合并为完整列表返回。需要启用后备搜索。">
+                            <QuestionCircleOutlined />
+                          </Tooltip>
+                        </div>
+                      }
+                      valuePropName="checked"
+                      style={isMobile ? {} : { flex: 1 }}
+                    >
+                      <Switch disabled={isFallbackDisabled} />
+                    </Form.Item>
+                  )
+                }}
+              </Form.Item>
+
+              <Form.Item
+                name="danmakuAutoRefreshDays"
+                label={
+                  <div className="flex items-center gap-2">
+                    <span>弹幕自动刷新间隔（天）</span>
+                    <Tooltip title="当播放客户端请求弹幕时，若距上次获取超过设定天数，将自动触发弹幕刷新。设为 0 则禁用此功能。">
+                      <QuestionCircleOutlined />
+                    </Tooltip>
+                  </div>
+                }
+              >
+                <InputNumber min={0} max={365} precision={0} style={{ width: '100%' }} placeholder="0（禁用）" />
+              </Form.Item>
+
+            </>
+          )}
         </div>
 
         <Form.Item
@@ -195,81 +411,91 @@ export const MatchFallbackSetting = () => {
               <Form.Item
                 label={
                   <Space>
-                    匹配后备Token授权
+                    后备功能 Token 授权
                     <Tooltip title="选择允许触发匹配后备功能的Token。如果不选择任何Token，则所有Token都可以触发后备功能。只有被选中的Token才能在匹配失败时自动触发后备搜索任务。">
                       <QuestionCircleOutlined />
                     </Tooltip>
                   </Space>
                 }
               >
-                <div style={{
-                  border: '1px solid #d9d9d9',
-                  borderRadius: '6px',
-                  padding: '12px',
-                  minHeight: '120px',
-                  backgroundColor: isTokenSelectionDisabled ? '#f5f5f5' : '#fafafa',
-                  opacity: isTokenSelectionDisabled ? 0.6 : 1
-                }}>
+                <Card
+                  size="small"
+                  className={`transition-all duration-200 ${
+                    isTokenSelectionDisabled
+                      ? 'bg-gray-50 border-gray-200 opacity-60'
+                      : 'bg-gradient-to-br from-blue-50 to-indigo-50 border-blue-200 shadow-sm hover:shadow-md'
+                  }`}
+                  bodyStyle={{ padding: '16px' }}
+                >
                   {tokenList.length === 0 ? (
-                    <div style={{ textAlign: 'center', color: '#999', padding: '20px' }}>
-                      暂无可用Token
+                    <div className="text-center py-8 text-gray-500">
+                      <div className="text-lg mb-2">📝</div>
+                      <div>暂无可用Token</div>
+                      <div className="text-sm mt-1">请先创建API Token</div>
                     </div>
                   ) : (
-                    <Form.Item
-                      name="matchFallbackTokens"
-                      style={{ marginBottom: 0 }}
-                    >
-                      <Checkbox.Group
-                        style={{ width: '100%' }}
-                        disabled={isTokenSelectionDisabled}
+                    <>
+                      <Form.Item
+                        name="matchFallbackTokens"
+                        style={{ marginBottom: 0 }}
                       >
-                        <div style={{
-                          display: 'flex',
-                          flexDirection: 'row',
-                          flexWrap: 'wrap',
-                          gap: '8px'
-                        }}>
-                          {tokenList.map(token => (
-                            <Checkbox
-                              key={token.id}
-                              value={token.id}
-                              disabled={isTokenSelectionDisabled}
-                              style={{
-                                padding: '6px 12px',
-                                border: '1px solid #e8e8e8',
-                                borderRadius: '4px',
-                                backgroundColor: '#fff',
-                                margin: 0,
-                                whiteSpace: 'nowrap'
-                              }}
-                            >
-                              <span style={{ fontWeight: 'normal' }}>
-                                {token.name}
-                                <span style={{
-                                  marginLeft: '8px',
-                                  fontSize: '12px',
-                                  color: token.isEnabled ? '#52c41a' : '#ff4d4f'
-                                }}>
-                                  ({token.isEnabled ? '启用' : '禁用'})
-                                </span>
-                              </span>
-                            </Checkbox>
-                          ))}
-                        </div>
-                      </Checkbox.Group>
-                    </Form.Item>
+                        <Checkbox.Group
+                          style={{ width: '100%' }}
+                          disabled={isTokenSelectionDisabled}
+                        >
+                          <div className={`grid gap-3 ${
+                            isMobile ? 'grid-cols-1' : 'grid-cols-2 md:grid-cols-3'
+                          }`}>
+                            {tokenList.map(token => (
+                              <div
+                                key={token.id}
+                                className={`
+                                  relative p-3 rounded-lg border transition-all duration-200 cursor-pointer
+                                  ${isTokenSelectionDisabled
+                                    ? 'bg-gray-100 border-gray-200 cursor-not-allowed'
+                                    : 'bg-white border-gray-200 hover:border-blue-300 hover:shadow-sm'
+                                  }
+                                `}
+                              >
+                                <Checkbox
+                                  value={token.id}
+                                  disabled={isTokenSelectionDisabled}
+                                  className="absolute top-2 right-2"
+                                />
+                                <div className="pr-6">
+                                  <div className="font-medium text-gray-900 mb-1">
+                                    {token.name}
+                                  </div>
+                                  <div className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ${
+                                    token.isEnabled
+                                      ? 'bg-green-100 text-green-800'
+                                      : 'bg-red-100 text-red-800'
+                                  }`}>
+                                    <span className={`w-1.5 h-1.5 rounded-full mr-1.5 ${
+                                      token.isEnabled ? 'bg-green-500' : 'bg-red-500'
+                                    }`}></span>
+                                    {token.isEnabled ? '启用' : '禁用'}
+                                  </div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </Checkbox.Group>
+                      </Form.Item>
+                      <div className="mt-4 pt-4 border-t border-gray-200 flex justify-end">
+                        <Button
+                          type="primary"
+                          loading={tokensSaving}
+                          onClick={handleTokensSave}
+                          disabled={isTokenSelectionDisabled}
+                          className="min-w-[100px]"
+                        >
+                          保存配置
+                        </Button>
+                      </div>
+                    </>
                   )}
-                  <div style={{ marginTop: '12px', textAlign: 'right' }}>
-                    <Button
-                      type="primary"
-                      loading={tokensSaving}
-                      onClick={handleTokensSave}
-                      disabled={isTokenSelectionDisabled}
-                    >
-                      保存
-                    </Button>
-                  </div>
-                </div>
+                </Card>
               </Form.Item>
             )
           }}
@@ -278,73 +504,35 @@ export const MatchFallbackSetting = () => {
         <Form.Item
           label={
             <Space>
-              匹配后备黑名单
+              后备匹配黑名单
               <Tooltip title="使用正则表达式过滤文件名，匹配的文件不会触发后备机制。例如：预告|广告|花絮 可以过滤包含这些关键词的文件。留空表示不过滤。">
                 <QuestionCircleOutlined />
               </Tooltip>
             </Space>
           }
         >
-          <Space.Compact style={{ width: '100%' }}>
+          <div className={isMobile ? "space-y-3" : "flex gap-3"}>
             <Form.Item
               name="matchFallbackBlacklist"
-              style={{ flex: 1, marginBottom: 0 }}
+              className={isMobile ? "mb-0" : "flex-1 mb-0"}
             >
               <Input.TextArea
                 placeholder="输入正则表达式，例如：预告|广告|花絮"
-                rows={2}
-                showCount
+                rows={isMobile ? 3 : 1}
+                className="resize-none"
               />
             </Form.Item>
-            <Button type="primary" loading={blacklistSaving} onClick={handleBlacklistSave}>
-              保存
-            </Button>
-          </Space.Compact>
-        </Form.Item>
-
-        <Form.Item
-          name="customDanmakuPathEnabled"
-          label="启用自定义弹幕保存路径"
-          valuePropName="checked"
-          tooltip="启用后，弹幕文件将按照自定义路径模板保存，而不是使用默认路径。"
-        >
-          <Switch />
-        </Form.Item>
-
-        <Form.Item
-          label={
-            <Space>
-              弹幕文件保存路径
-              <Tooltip title="支持变量：${title}(标题), ${season}(季度), ${episode}(集数), ${year}(年份), ${provider}(提供商), ${animeId}(动画ID), ${episodeId}(分集ID)。格式化：${season:02d}表示两位数字补零。.xml后缀会自动添加。Windows系统可使用绝对路径如：D:/弹幕/${title}/${episode:03d}">
-                <QuestionCircleOutlined />
-              </Tooltip>
-            </Space>
-          }
-        >
-          <Space.Compact style={{ width: '100%' }}>
-            <Form.Item
-              name="customDanmakuPathTemplate"
-              style={{ flex: 1, marginBottom: 0 }}
+            <Button
+              type="primary"
+              loading={blacklistSaving}
+              onClick={handleBlacklistSave}
+              className={isMobile ? "w-full" : ""}
+              style={isMobile ? {} : { height: '32px', minHeight: '32px', minWidth: '100px' }}
             >
-              <Input
-                placeholder="自定义保存路径"
-                disabled={!customPathEnabled}
-              />
-            </Form.Item>
-            <Button onClick={handlePathReset} disabled={!customPathEnabled}>
-              重置
+              保存黑名单
             </Button>
-            <Button type="primary" loading={pathSaving} onClick={handlePathSave}>
-              保存
-            </Button>
-          </Space.Compact>
+          </div>
         </Form.Item>
-
-        <div style={{ fontSize: '12px', color: '#666', marginTop: '-16px' }}>
-          <div>默认路径：/app/config/danmaku/$&#123;animeId&#125;/$&#123;episodeId&#125;</div>
-          <div>支持的变量：$&#123;title&#125;, $&#123;season&#125;, $&#123;episode&#125;, $&#123;year&#125;, $&#123;provider&#125;, $&#123;animeId&#125;, $&#123;episodeId&#125;</div>
-          <div>格式化选项：$&#123;season:02d&#125; 表示季度号补零到2位，$&#123;episode:03d&#125; 表示集数补零到3位</div>
-        </div>
       </Form>
     </Card>
   )

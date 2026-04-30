@@ -57,16 +57,17 @@ export function ModalProvider({ children }) {
                 await config.onOk() // 执行用户传入的 onOk
               }
               resolve()
-              closeModal(modalId) // 关闭当前 modal
             } catch (error) {
               reject(error)
+            } finally {
+              closeModal(modalId) // 无论成功失败都关闭当前 modal
             }
           },
           onCancel: () => {
             if (config.onCancel) {
               config.onCancel()
             }
-            reject(new Error('用户取消'))
+            resolve(false) // 用户取消，返回 false
             closeModal(modalId) // 关闭当前 modal
           },
           confirmLoading: config.confirmLoading || false,
