@@ -8,6 +8,8 @@ from .config import (
     get_config_value,
     update_config_value,
     initialize_configs,
+    allocate_next_counter_value,
+    LAST_ALLOCATED_ANIME_ID_KEY,
 )
 
 # User模块
@@ -17,11 +19,17 @@ from .user import (
     create_user,
     update_user_password,
     update_user_login_info,
+    enable_user_otp,
+    disable_user_otp,
     create_oauth_state,
     consume_oauth_state,
     get_bangumi_auth,
     save_bangumi_auth,
     delete_bangumi_auth,
+    get_oauth_credential,
+    save_oauth_credential,
+    delete_oauth_credential,
+    get_oauth_credential_with_token,
 )
 
 # Task模块
@@ -192,6 +200,9 @@ from .source import (
     reset_incremental_refresh_failures,
     disable_incremental_refresh,
     get_sources_with_incremental_refresh_enabled,
+    get_calendar_sources,
+    update_air_schedule,
+    update_metadata_ids,
     _assign_source_order_if_missing,
     get_incremental_refresh_sources_grouped,
     batch_toggle_incremental_refresh,
@@ -248,6 +259,8 @@ from .api_token import (
 # TokenLog模块
 from .token_log import (
     create_token_access_log,
+    create_token_access_log_awaited,
+    update_token_access_log_response,
     get_token_access_logs,
     get_ua_rules,
     add_ua_rule,
@@ -315,22 +328,33 @@ from .utility import (
     update_scheduled_task_run_times,
 )
 
+# PassKey模块
+from . import passkey
+
 __all__ = [
     # Config
     'get_config_value',
     'update_config_value',
     'initialize_configs',
+    'allocate_next_counter_value',
+    'LAST_ALLOCATED_ANIME_ID_KEY',
     # User
     'get_user_by_id',
     'get_user_by_username',
     'create_user',
     'update_user_password',
     'update_user_login_info',
+    'enable_user_otp',
+    'disable_user_otp',
     'create_oauth_state',
     'consume_oauth_state',
     'get_bangumi_auth',
     'save_bangumi_auth',
     'delete_bangumi_auth',
+    'get_oauth_credential',
+    'save_oauth_credential',
+    'delete_oauth_credential',
+    'get_oauth_credential_with_token',
     # Task
     'is_system_task',
     'get_scheduled_tasks',
@@ -468,6 +492,9 @@ __all__ = [
     'reset_incremental_refresh_failures',
     'disable_incremental_refresh',
     'get_sources_with_incremental_refresh_enabled',
+    'get_calendar_sources',
+    'update_air_schedule',
+    'update_metadata_ids',
     '_assign_source_order_if_missing',
     'split_source_episodes',
     'get_source_episode_list',

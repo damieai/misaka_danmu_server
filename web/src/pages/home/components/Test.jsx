@@ -4,10 +4,13 @@ import {
   searchAnimeTest,
   getBangumiDetailTest,
   getCommentTest,
+  pollTaskCommentTest,
   parseFilenameTest,
   getTokenList,
+  matchTrace,
 } from '../../../apis'
 import { useState, useEffect, useMemo } from 'react'
+import { useTranslation } from 'react-i18next'
 import {
   Button,
   Card,
@@ -19,10 +22,13 @@ import {
   Tag,
   Alert,
   Pagination,
+  Switch,
+  Collapse,
 } from 'antd'
-import { SearchOutlined } from '@ant-design/icons'
+import { SearchOutlined, CheckCircleOutlined, CloseCircleOutlined, ClockCircleOutlined } from '@ant-design/icons'
 
 export const Test = () => {
+  const { t } = useTranslation()
   const [loading, setLoading] = useState(false)
   const [form] = Form.useForm()
   const [result, setResult] = useState(null)
@@ -32,11 +38,14 @@ export const Test = () => {
   const [searchKeyword, setSearchKeyword] = useState('')
   const [currentPage, setCurrentPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
+  const [showRaw, setShowRaw] = useState(false)
 
   // 加载 token 列表
   useEffect(() => {
     fetchTokens()
   }, [])
+
+  const STORAGE_KEY = 'test_selected_token'
 
   const fetchTokens = async () => {
     try {
@@ -57,19 +66,32 @@ export const Test = () => {
     }
   }
 
+  // tokens 加载完成后自动选中：优先恢复缓存，否则选第一个
+  useEffect(() => {
+    if (tokens.length === 0) return
+    const cached = localStorage.getItem(STORAGE_KEY)
+    const current = form.getFieldValue('apiToken')
+    // 已有值（且仍在有效列表中）就不覆盖
+    if (current && tokens.find(t => t.token === current)) return
+    const target = (cached && tokens.find(t => t.token === cached))
+      ? cached
+      : tokens[0].token
+    form.setFieldValue('apiToken', target)
+  }, [tokens])
+
   // 测试配置：每个测试类型的配置
   const testConfigs = {
     match: {
-      label: '文件名匹配',
+      label: t('apiTest.matchLabel'),
       apiPath: '/api/v1/{token}/match',
       method: 'POST',
       handler: getMatchTest,
       fields: [
         {
           name: 'fileName',
-          label: '文件名',
+          label: t('apiTest.fileName'),
           apiParam: 'fileName',
-          placeholder: '请输入要测试匹配的文件名',
+          placeholder: t('apiTest.inputMatchFileName'),
           required: true,
           component: Input,
         },
@@ -82,11 +104,11 @@ export const Test = () => {
       },
       renderHeader: data => {
         const hasMatches = data?.matches && data.matches.length > 0
-        if (!hasMatches) return <div className="text-red-600">[匹配失败] 未匹配到任何结果</div>
+        if (!hasMatches) return <div className="text-red-600">{t('apiTest.matchFailed')}</div>
         const statusColor = data.isMatched ? 'text-green-600' : 'text-orange-600'
         const statusText = data.isMatched
-          ? '[精确匹配]'
-          : `[多个匹配] 找到 ${data.matches.length} 个可能的匹配`
+          ? t('apiTest.exactMatch')
+          : t('apiTest.multiMatch', { count: data.matches.length })
         return <div className={`font-bold ${statusColor}`}>{statusText}</div>
       },
       renderItem: (it, index, data) => (
@@ -94,8 +116,8 @@ export const Test = () => {
           key={index}
           className={`p-3 rounded border ${
             data?.isMatched
-              ? 'bg-green-50 border-green-200'
-              : 'bg-blue-50 border-blue-200'
+              ? 'bg-green-50 dark:bg-green-950 border-green-200 dark:border-green-800'
+              : 'bg-blue-50 dark:bg-blue-950 border-blue-200 dark:border-blue-800'
           }`}
         >
           <div className="flex items-start gap-3">
@@ -103,19 +125,19 @@ export const Test = () => {
               <img src={it.imageUrl} alt={it.animeTitle} className="w-16 h-24 object-cover rounded" />
             )}
             <div className="flex-1">
-              <div className="font-semibold text-gray-800">
+              <div className="font-semibold text-gray-800 dark:text-gray-200">
                 {it.animeTitle}
-                <span className="ml-2 text-xs text-gray-500">(作品ID: {it.animeId})</span>
+                <span className="ml-2 text-xs text-gray-500 dark:text-gray-400">({t('apiTest.animeIdLabel', { id: it.animeId })})</span>
               </div>
-              <div className="text-sm text-gray-600 mt-1">
+              <div className="text-sm text-gray-600 dark:text-gray-400 mt-1">
                 {it.episodeTitle}
-                <span className="ml-2 text-xs text-gray-400">(分集ID: {it.episodeId})</span>
+                <span className="ml-2 text-xs text-gray-400 dark:text-gray-500">({t('apiTest.episodeIdLabel', { id: it.episodeId })})</span>
               </div>
-              <div className="text-xs text-gray-500 mt-1">
+              <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">
                 <Tag color={it.type === 'tvseries' ? 'blue' : 'purple'}>{it.typeDescription}</Tag>
                 {it.shift !== 0 && (
                   <Tag color="orange" className="ml-1">
-                    偏移: {it.shift > 0 ? `+${it.shift}` : it.shift}
+                    {t('apiTest.offsetLabel', { value: it.shift > 0 ? `+${it.shift}` : it.shift })}
                   </Tag>
                 )}
               </div>
@@ -125,24 +147,24 @@ export const Test = () => {
       ),
     },
     searchEpisodes: {
-      label: '搜索分集',
+      label: t('apiTest.searchEpisodesLabel'),
       apiPath: '/api/v1/{token}/search/episodes',
       method: 'GET',
       handler: searchEpisodesTest,
       fields: [
         {
           name: 'anime',
-          label: '节目名称',
+          label: t('apiTest.programName'),
           apiParam: 'anime (query)',
-          placeholder: '请输入节目名称',
+          placeholder: t('apiTest.inputProgramName'),
           required: true,
           component: Input,
         },
         {
           name: 'episode',
-          label: '分集标题',
+          label: t('apiTest.episodeTitle'),
           apiParam: 'episode (query)',
-          placeholder: '请输入分集标题（可选）',
+          placeholder: t('apiTest.inputEpisodeTitle'),
           required: false,
           component: Input,
         },
@@ -155,29 +177,29 @@ export const Test = () => {
       },
       renderHeader: data => {
         if (data?.animes && data.animes.length > 0) {
-          return <div className="font-bold text-green-600">[搜索成功] 找到 {data.animes.length} 个结果</div>
+          return <div className="font-bold text-green-600">{t('apiTest.searchSuccess', { count: data.animes.length })}</div>
         }
-        return <div className="text-red-600">[搜索失败] 未找到结果</div>
+        return <div className="text-red-600">{t('apiTest.searchFailed')}</div>
       },
       renderItem: (anime, index) => (
-        <div key={index} className="p-2 bg-blue-50 rounded">
-          <div>番剧: {anime.animeTitle} (ID: {anime.animeId})</div>
-          <div>类型: {anime.typeDescription}</div>
-          {anime.episodes && <div>分集数: {anime.episodes.length}</div>}
+        <div key={index} className="p-2 bg-blue-50 dark:bg-blue-950 rounded border border-blue-200 dark:border-blue-800">
+          <div className="text-gray-800 dark:text-gray-200">{t('apiTest.animeLabel', { title: anime.animeTitle, id: anime.animeId })}</div>
+          <div className="text-gray-600 dark:text-gray-400">{t('apiTest.typeLabel', { value: anime.typeDescription })}</div>
+          {anime.episodes && <div className="text-gray-600 dark:text-gray-400">{t('apiTest.episodeCountLabel', { count: anime.episodes.length })}</div>}
         </div>
       ),
     },
     searchAnime: {
-      label: '搜索作品',
+      label: t('apiTest.searchAnimeLabel'),
       apiPath: '/api/v1/{token}/search/anime',
       method: 'GET',
       handler: searchAnimeTest,
       fields: [
         {
           name: 'keyword',
-          label: '关键词',
+          label: t('apiTest.keyword'),
           apiParam: 'keyword (query)',
-          placeholder: '请输入搜索关键词',
+          placeholder: t('apiTest.inputKeyword'),
           required: true,
           component: Input,
         },
@@ -190,68 +212,146 @@ export const Test = () => {
       },
       renderHeader: data => {
         if (data?.animes && data.animes.length > 0) {
-          return <div className="font-bold text-green-600">[搜索成功] 找到 {data.animes.length} 个结果</div>
+          return <div className="font-bold text-green-600">{t('apiTest.searchSuccess', { count: data.animes.length })}</div>
         }
-        return <div className="text-red-600">[搜索失败] 未找到结果</div>
+        return <div className="text-red-600">{t('apiTest.searchFailed')}</div>
       },
       renderItem: (anime, index) => (
-        <div key={index} className="p-2 bg-blue-50 rounded">
-          <div>番剧: {anime.animeTitle} (ID: {anime.animeId})</div>
-          <div>类型: {anime.typeDescription}</div>
-          <div>分集数: {anime.episodeCount || 0}</div>
+        <div key={index} className="p-3 bg-blue-50 dark:bg-blue-950 rounded border border-blue-200 dark:border-blue-800">
+          <div className="flex items-start gap-3">
+            {anime.imageUrl && (
+              <img src={anime.imageUrl} alt={anime.animeTitle} className="w-16 h-24 object-cover rounded" />
+            )}
+            <div className="flex-1">
+              <div className="font-semibold text-gray-800 dark:text-gray-200">
+                {anime.animeTitle}
+                <span className="ml-2 text-xs text-gray-500 dark:text-gray-400">(ID: {anime.animeId})</span>
+              </div>
+              <div className="text-sm text-gray-600 dark:text-gray-400 mt-1">{t('apiTest.typeLabel', { value: anime.typeDescription })}</div>
+              <div className="text-sm text-gray-600 dark:text-gray-400">{t('apiTest.episodeCountLabel', { count: anime.episodeCount || 0 })}</div>
+              {anime.year && <div className="text-xs text-gray-400 dark:text-gray-500 mt-1">{t('apiTest.yearSuffix', { year: anime.year })}</div>}
+            </div>
+          </div>
         </div>
       ),
     },
     bangumiDetail: {
-      label: '番剧详情',
+      label: t('apiTest.bangumiDetailLabel'),
       apiPath: '/api/v1/{token}/bangumi/{id}',
       method: 'GET',
       handler: getBangumiDetailTest,
       fields: [
         {
           name: 'bangumiId',
-          label: '番剧ID',
+          label: t('apiTest.bangumiId'),
           apiParam: 'id (path)',
-          placeholder: '支持纯数字ID、A开头的备用ID（如 A900002）、或Bangumi ID',
+          placeholder: t('apiTest.inputBangumiId'),
           required: true,
           component: Input,
         },
       ],
-      // 番剧详情是单条数据，不需要分页
-      renderResult: data => {
+      getListData: data => data?.bangumi?.episodes || [],
+      searchFilter: (item, keyword) => {
+        const kw = keyword.toLowerCase()
+        return (item.episodeTitle || '').toLowerCase().includes(kw)
+      },
+      renderHeader: data => {
         if (data?.bangumi) {
-          const bangumi = data.bangumi
+          const b = data.bangumi
+          const epCount = b.episodes?.length || 0
           return (
-            <div className="font-bold text-green-600">
-              <div>[查询成功]</div>
-              <div className="mt-2 p-2 bg-blue-50 rounded font-normal">
-                <div>标题: {bangumi.animeTitle}</div>
-                <div>类型: {bangumi.typeDescription}</div>
+            <div className="space-y-2">
+              <div className="font-bold text-green-600">{t('apiTest.querySuccess')}</div>
+              <div className="flex items-start gap-3 p-3 bg-blue-50 dark:bg-blue-950 rounded border border-blue-200 dark:border-blue-800">
+                {b.imageUrl && (
+                  <img src={b.imageUrl} alt={b.animeTitle} className="w-20 h-28 object-cover rounded" />
+                )}
+                <div className="flex-1 space-y-1">
+                  <div className="font-semibold text-gray-800 dark:text-gray-200 text-base">{b.animeTitle}</div>
+                  <div className="flex flex-wrap gap-1.5 text-xs">
+                    <Tag color="blue">{b.typeDescription || b.type}</Tag>
+                    {b.rating > 0 && <Tag color="gold">{t('apiTest.rating', { value: b.rating })}</Tag>}
+                    {b.isFavorited && <Tag color="red">{t('apiTest.favorited')}</Tag>}
+                  </div>
+                  <div className="text-sm text-gray-600 dark:text-gray-400">
+                    {t('apiTest.animeIdLabel', { id: '' })}<code className="bg-gray-100 dark:bg-gray-800 px-1 rounded">{b.animeId}</code>
+                    {b.bangumiId && <span className="ml-2">Bangumi: <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded">{b.bangumiId}</code></span>}
+                  </div>
+                  <div className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                    {t('apiTest.episodeCountTotal', { count: epCount })}
+                  </div>
+                </div>
               </div>
             </div>
           )
         }
         return (
           <div className="text-red-600">
-            [查询失败] {data?.errorMessage || '未找到番剧详情'}
+            {t('apiTest.queryFailed', { msg: data?.errorMessage || t('apiTest.noBangumiDetail') })}
           </div>
         )
       },
+      renderItem: (ep, index) => (
+        <div key={index} className="flex items-center gap-3 py-2 px-3 rounded hover:bg-gray-100 dark:hover:bg-gray-800 border-b border-gray-100 dark:border-gray-800">
+          <span className="text-gray-400 dark:text-gray-500 font-mono w-8 text-right shrink-0">
+            {ep.episodeNumber != null ? ep.episodeNumber : index + 1}
+          </span>
+          <span className="flex-1 truncate" title={ep.episodeTitle}>{ep.episodeTitle || t('apiTest.unknown')}</span>
+          <code className="text-xs text-gray-400 dark:text-gray-500 shrink-0">ID: {ep.episodeId}</code>
+        </div>
+      ),
     },
     comment: {
-      label: '弹幕获取',
+      label: t('apiTest.commentLabel'),
       apiPath: '/api/v1/{token}/comment/{episodeId}',
       method: 'GET',
       handler: getCommentTest,
       fields: [
         {
           name: 'episodeId',
-          label: '分集ID',
+          label: t('apiTest.episodeId'),
           apiParam: 'episodeId (path)',
-          placeholder: '请输入分集ID',
+          placeholder: t('apiTest.inputEpisodeId'),
           required: true,
           component: InputNumber,
           componentProps: { className: 'w-full', style: { width: '100%' } },
+        },
+        {
+          name: 'chConvert',
+          label: t('apiTest.chConvert'),
+          apiParam: 'chConvert (query)',
+          tooltip: t('apiTest.chConvertTip'),
+          required: false,
+          component: Select,
+          componentProps: {
+            placeholder: t('apiTest.chConvertPlaceholder'),
+            allowClear: true,
+            options: [
+              { label: t('apiTest.chConvert0'), value: 0 },
+              { label: t('apiTest.chConvert1'), value: 1 },
+              { label: t('apiTest.chConvert2'), value: 2 },
+            ],
+          },
+        },
+        {
+          name: 'withRelated',
+          label: t('apiTest.withRelated'),
+          apiParam: 'withRelated (query)',
+          tooltip: t('apiTest.withRelatedTip'),
+          required: false,
+          component: Switch,
+          componentProps: { checkedChildren: t('common.yes'), unCheckedChildren: t('common.no'), defaultChecked: true },
+          valuePropName: 'checked',
+        },
+        {
+          name: 'asyncMode',
+          label: t('apiTest.asyncMode'),
+          apiParam: 'async (query)',
+          tooltip: t('apiTest.asyncModeTip'),
+          required: false,
+          component: Switch,
+          componentProps: { checkedChildren: t('apiTest.on'), unCheckedChildren: t('apiTest.off') },
+          valuePropName: 'checked',
         },
       ],
       getListData: data => data?.comments || [],
@@ -262,7 +362,7 @@ export const Test = () => {
       },
       renderHeader: data => {
         if (!data?.comments || data.comments.length === 0) {
-          return <div className="text-red-600">[获取失败] 未找到弹幕</div>
+          return <div className="text-red-600">{t('apiTest.getFailed')}</div>
         }
         const comments = data.comments
         const total = data.count || comments.length
@@ -271,14 +371,14 @@ export const Test = () => {
         const times = []
         const modeCount = {}
         const colorCount = {}
-        const modeLabels = { 1: '滚动', 4: '底部', 5: '顶部', 6: '逆向', 7: '精准', 8: '高级' }
+        const modeLabelsMap = { 1: t('apiTest.modeScroll'), 4: t('apiTest.modeBottom'), 5: t('apiTest.modeTop'), 6: t('apiTest.modeReverse'), 7: t('apiTest.modePrecise'), 8: t('apiTest.modeAdvanced') }
         for (const c of comments) {
           const parts = (c.p || '').split(',')
-          const t = parseFloat(parts[0] || 0)
+          const timeVal = parseFloat(parts[0] || 0)
           const mode = parseInt(parts[1] || 1)
           const color = parseInt(parts[2] || 16777215)
-          times.push(t)
-          const ml = modeLabels[mode] || `模式${mode}`
+          times.push(timeVal)
+          const ml = modeLabelsMap[mode] || t('apiTest.modeOther', { mode })
           modeCount[ml] = (modeCount[ml] || 0) + 1
           const hex = '#' + color.toString(16).padStart(6, '0')
           colorCount[hex] = (colorCount[hex] || 0) + 1
@@ -290,12 +390,12 @@ export const Test = () => {
         const bucketSize = Math.max(Math.ceil(maxTime / targetBuckets), 10)  // 最小10秒/桶
         const bucketCount = Math.ceil(maxTime / bucketSize)
         const buckets = new Array(bucketCount).fill(0)
-        for (const t of times) {
-          const idx = Math.min(Math.floor(t / bucketSize), bucketCount - 1)
+        for (const tv of times) {
+          const idx = Math.min(Math.floor(tv / bucketSize), bucketCount - 1)
           buckets[idx]++
         }
         const maxBucket = Math.max(...buckets, 1)
-        const bucketLabel = bucketSize >= 60 ? `${Math.round(bucketSize / 60)}分钟` : `${bucketSize}秒`
+        const bucketLabel = bucketSize >= 60 ? t('apiTest.minuteUnit', { count: Math.round(bucketSize / 60) }) : t('apiTest.secondUnit', { count: bucketSize })
 
         // 统计
         const durationMin = Math.floor(maxTime / 60)
@@ -305,27 +405,27 @@ export const Test = () => {
 
         return (
           <div className="space-y-3">
-            <div className="font-bold text-green-600">[获取成功] 共 {total} 条弹幕</div>
+            <div className="font-bold text-green-600">{t('apiTest.getSuccess', { count: total })}</div>
 
             {/* 弹幕热力图 */}
             <div>
-              <div className="text-xs text-gray-500 mb-1">弹幕密度分布 (每{bucketLabel})</div>
+              <div className="text-xs text-gray-500 dark:text-gray-400 mb-1">{t('apiTest.densityDistribution', { unit: bucketLabel })}</div>
               <div className="flex items-end gap-px h-16 bg-gray-100 dark:bg-gray-800 rounded p-1 overflow-hidden">
                 {buckets.map((count, i) => {
                   const h = Math.max((count / maxBucket) * 100, count > 0 ? 4 : 0)
                   const intensity = count / maxBucket
-                  const bg = intensity > 0.8 ? 'bg-red-500' : intensity > 0.5 ? 'bg-orange-400' : intensity > 0.2 ? 'bg-blue-400' : 'bg-blue-200'
+                  const bg = intensity > 0.8 ? 'bg-red-500' : intensity > 0.5 ? 'bg-orange-400' : intensity > 0.2 ? 'bg-blue-400' : 'bg-blue-200 dark:bg-blue-700'
                   const startSec = i * bucketSize
                   const endSec = Math.min((i + 1) * bucketSize, maxTime)
                   const fmtTime = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
                   return (
-                    <div key={i} className="flex-1 flex flex-col justify-end h-full" title={`${fmtTime(startSec)} ~ ${fmtTime(endSec)} — ${count} 条`}>
+                    <div key={i} className="flex-1 flex flex-col justify-end h-full" title={t('apiTest.barTooltip', { start: fmtTime(startSec), end: fmtTime(endSec), count })}>
                       <div className={`${bg} rounded-t-sm transition-all`} style={{ height: `${h}%`, minWidth: 2 }} />
                     </div>
                   )
                 })}
               </div>
-              <div className="flex justify-between text-xs text-gray-400 mt-0.5 px-1">
+              <div className="flex justify-between text-xs text-gray-400 dark:text-gray-500 mt-0.5 px-1">
                 <span>0:00</span>
                 <span>{durationMin}:{String(durationSec).padStart(2, '0')}</span>
               </div>
@@ -335,7 +435,7 @@ export const Test = () => {
             <div className="flex flex-wrap gap-4 text-xs">
               {/* 弹幕模式分布 */}
               <div>
-                <div className="text-gray-500 mb-1">模式分布</div>
+                <div className="text-gray-500 dark:text-gray-400 mb-1">{t('apiTest.modeDistribution')}</div>
                 <div className="flex flex-wrap gap-1">
                   {modeEntries.map(([label, count]) => (
                     <Tag key={label} className="!text-xs !m-0">{label}: {count}</Tag>
@@ -344,12 +444,12 @@ export const Test = () => {
               </div>
               {/* 热门颜色 */}
               <div>
-                <div className="text-gray-500 mb-1">热门颜色</div>
+                <div className="text-gray-500 dark:text-gray-400 mb-1">{t('apiTest.popularColors')}</div>
                 <div className="flex gap-1">
                   {topColors.map(([hex, count]) => (
-                    <div key={hex} className="flex items-center gap-0.5" title={`${hex} (${count}条)`}>
-                      <span className="w-3 h-3 rounded-sm border border-gray-200" style={{ backgroundColor: hex }} />
-                      <span className="text-gray-400">{count}</span>
+                    <div key={hex} className="flex items-center gap-0.5" title={t('apiTest.colorTooltip', { hex, count })}>
+                      <span className="w-3 h-3 rounded-sm border border-gray-200 dark:border-gray-700" style={{ backgroundColor: hex }} />
+                      <span className="text-gray-400 dark:text-gray-500">{count}</span>
                     </div>
                   ))}
                 </div>
@@ -364,8 +464,8 @@ export const Test = () => {
         const time = parseFloat(parts[0] || 0)
         const mode = parseInt(parts[1] || 1)
         const color = parseInt(parts[2] || 16777215)
-        const modeLabels = { 1: '滚动', 4: '底部', 5: '顶部', 6: '逆向', 7: '精准', 8: '高级' }
-        const modeLabel = modeLabels[mode] || `模式${mode}`
+        const modeLabelsMap2 = { 1: t('apiTest.modeScroll'), 4: t('apiTest.modeBottom'), 5: t('apiTest.modeTop'), 6: t('apiTest.modeReverse'), 7: t('apiTest.modePrecise'), 8: t('apiTest.modeAdvanced') }
+        const modeLabel = modeLabelsMap2[mode] || t('apiTest.modeOther', { mode })
         // 将十进制颜色转为 #RRGGBB
         const hexColor = '#' + color.toString(16).padStart(6, '0')
         const mins = Math.floor(time / 60)
@@ -381,8 +481,60 @@ export const Test = () => {
         )
       },
     },
+    taskcomment: {
+      label: t('apiTest.taskCommentLabel'),
+      apiPath: '/api/v1/{token}/taskcomment/{taskId}',
+      method: 'GET',
+      handler: pollTaskCommentTest,
+      fields: [
+        {
+          name: 'taskId',
+          label: t('apiTest.taskId'),
+          apiParam: 'taskId (path)',
+          placeholder: t('apiTest.inputTaskId'),
+          required: true,
+          component: Input,
+        },
+      ],
+      renderResult: data => {
+        const statusColor = {
+          completed: 'text-green-600',
+          pending: 'text-blue-500',
+          failed: 'text-red-600',
+        }[data?.status] || 'text-gray-600 dark:text-gray-400'
+        const statusLabel = {
+          completed: t('apiTest.statusCompleted'),
+          pending: t('apiTest.statusPending'),
+          failed: t('apiTest.statusFailed'),
+        }[data?.status] || t('apiTest.statusUnknown')
+        return (
+          <div className="space-y-2">
+            <div className={`font-bold ${statusColor}`}>
+              {statusLabel}
+              {data?.taskId && <span className="ml-2 text-xs font-mono text-gray-400 dark:text-gray-500">{data.taskId}</span>}
+            </div>
+            {data?.description && (
+              <div className="text-sm text-gray-500 dark:text-gray-400">{data.description}</div>
+            )}
+            {data?.progress != null && data.status === 'pending' && (
+              <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-1.5">
+                <div className="bg-blue-500 h-1.5 rounded-full transition-all" style={{ width: `${data.progress}%` }} />
+              </div>
+            )}
+            {data?.episodeId != null && (
+              <div className="text-sm text-gray-600 dark:text-gray-400">
+                episodeId: <code className="bg-gray-100 dark:bg-gray-800 px-1.5 py-0.5 rounded font-mono">{data.episodeId}</code>
+                {data.status === 'completed' && (
+                  <span className="ml-2 text-xs text-gray-400 dark:text-gray-500">{t('apiTest.useIdForComment')}</span>
+                )}
+              </div>
+            )}
+          </div>
+        )
+      },
+    },
     fileRecognition: {
-      label: '文件识别',
+      label: t('apiTest.fileRecognitionLabel'),
       apiPath: '/api/ui/tools/parse-filename',
       method: 'POST',
       noToken: true,
@@ -390,9 +542,9 @@ export const Test = () => {
       fields: [
         {
           name: 'fileName',
-          label: '文件名',
+          label: t('apiTest.fileName'),
           apiParam: 'fileName (body)',
-          placeholder: '例: [SubGroup] Anime Name S01E02 [1080p].mkv',
+          placeholder: t('apiTest.recognitionPlaceholder'),
           required: true,
           component: Input,
         },
@@ -401,29 +553,29 @@ export const Test = () => {
         if (data?.success && data.result) {
           const r = data.result
           const fields = [
-            { label: '标题', value: r.title },
-            { label: '原始标题', value: r.original_title },
-            { label: '英文名', value: r.en_name },
-            { label: '季', value: r.season },
-            { label: '集', value: r.episode },
-            { label: '类型', value: r.is_movie ? '电影' : '剧集' },
-            { label: '年份', value: r.year },
-            { label: '分辨率', value: r.resolution },
-            { label: '视频编码', value: r.video_codec },
-            { label: '音频编码', value: r.audio_codec },
-            { label: '来源', value: r.source },
-            { label: '字幕组', value: r.team },
-            { label: '动态范围', value: r.dynamic_range },
-            { label: '平台', value: r.platform },
-            { label: '特效', value: r.effect },
+            { label: t('apiTest.rTitle'), value: r.title },
+            { label: t('apiTest.rOriginalTitle'), value: r.original_title },
+            { label: t('apiTest.rEnName'), value: r.en_name },
+            { label: t('apiTest.rSeason'), value: r.season },
+            { label: t('apiTest.rEpisode'), value: r.episode },
+            { label: t('apiTest.rType'), value: r.is_movie ? t('apiTest.rMovie') : t('apiTest.rSeries') },
+            { label: t('apiTest.rYear'), value: r.year },
+            { label: t('apiTest.rResolution'), value: r.resolution },
+            { label: t('apiTest.rVideoCodec'), value: r.video_codec },
+            { label: t('apiTest.rAudioCodec'), value: r.audio_codec },
+            { label: t('apiTest.rSource'), value: r.source },
+            { label: t('apiTest.rTeam'), value: r.team },
+            { label: t('apiTest.rDynamicRange'), value: r.dynamic_range },
+            { label: t('apiTest.rPlatform'), value: r.platform },
+            { label: t('apiTest.rEffect'), value: r.effect },
           ].filter(f => f.value != null && f.value !== '')
           return (
             <div>
-              <div className="font-bold text-green-600 mb-2">[识别成功]</div>
+              <div className="font-bold text-green-600 mb-2">{t('apiTest.recognitionSuccess')}</div>
               <div className="space-y-1">
                 {fields.map(f => (
                   <div key={f.label} className="flex gap-2 text-sm">
-                    <span className="text-gray-500 w-20 shrink-0">{f.label}:</span>
+                    <span className="text-gray-500 dark:text-gray-400 w-20 shrink-0">{f.label}:</span>
                     <span className="font-mono">{String(f.value)}</span>
                   </div>
                 ))}
@@ -431,7 +583,82 @@ export const Test = () => {
             </div>
           )
         }
-        return <div className="text-red-600">[识别失败] {data?.message || '无法识别该文件名'}</div>
+        return <div className="text-red-600">{t('apiTest.recognitionFailed', { msg: data?.message || t('apiTest.cannotRecognize') })}</div>
+      },
+    },
+    matchDebug: {
+      label: t('matchDebugger.title'),
+      apiPath: '/api/ui/debug/match-trace',
+      method: 'POST',
+      noToken: true,
+      handler: (values) => matchTrace({ title: values.debugTitle, season: values.debugSeason || undefined, episode: values.debugEpisode || undefined }),
+      fields: [
+        {
+          name: 'debugTitle',
+          label: t('matchDebugger.inputTitle'),
+          apiParam: 'title (body)',
+          placeholder: t('matchDebugger.titlePlaceholder'),
+          required: true,
+          component: Input,
+        },
+        {
+          name: 'debugSeason',
+          label: t('matchDebugger.season'),
+          apiParam: 'season (body)',
+          placeholder: 'S',
+          component: InputNumber,
+          componentProps: { min: 1, style: { width: 80 } },
+        },
+        {
+          name: 'debugEpisode',
+          label: t('matchDebugger.episode'),
+          apiParam: 'episode (body)',
+          placeholder: 'E',
+          component: InputNumber,
+          componentProps: { min: 1, style: { width: 80 } },
+        },
+      ],
+      renderResult: data => {
+        if (!data?.steps) return <div className="text-red-600">{data?.error || 'Unknown error'}</div>
+        const collapseItems = data.steps.map((step, idx) => ({
+          key: idx,
+          label: (
+            <div className="flex items-center gap-2">
+              {step.success
+                ? <CheckCircleOutlined className="text-green-500" />
+                : <CloseCircleOutlined className="text-red-500" />}
+              <span className="font-medium">{step.name}</span>
+              <Tag size="small"><ClockCircleOutlined /> {step.duration_ms?.toFixed(0)}ms</Tag>
+            </div>
+          ),
+          children: (
+            <div className="space-y-2 text-xs">
+              {step.input_data && (
+                <div>
+                  <span className="font-semibold text-gray-500">{t('matchDebugger.input')}:</span>
+                  <pre className="bg-gray-50 dark:bg-gray-800 p-2 rounded mt-1 overflow-auto max-h-40 whitespace-pre-wrap">{JSON.stringify(step.input_data, null, 2)}</pre>
+                </div>
+              )}
+              {step.output_data && (
+                <div>
+                  <span className="font-semibold text-gray-500">{t('matchDebugger.output')}:</span>
+                  <pre className="bg-green-50 dark:bg-green-900/20 p-2 rounded mt-1 overflow-auto max-h-60 whitespace-pre-wrap">{JSON.stringify(step.output_data, null, 2)}</pre>
+                </div>
+              )}
+              {step.details && <div className="text-orange-500">{step.details}</div>}
+            </div>
+          ),
+        }))
+        return (
+          <div>
+            <div className="flex gap-4 mb-3 text-sm">
+              <span>{t('matchDebugger.steps')}: <strong>{data.steps.length}</strong></span>
+              <span>{t('matchDebugger.results')}: <strong>{data.result_count}</strong></span>
+              <span>{t('matchDebugger.totalTime')}: <strong>{data.total_duration_ms?.toFixed(0)}ms</strong></span>
+            </div>
+            <Collapse items={collapseItems} defaultActiveKey={collapseItems.map((_, i) => i)} size="small" />
+          </div>
+        )
       },
     },
   }
@@ -445,7 +672,6 @@ export const Test = () => {
 
       const config = testConfigs[activeTab]
       const res = await config.handler({ apiToken: values.apiToken, ...values })
-      console.log('测试结果:', res)
 
       setResult(res?.data || res)
     } catch (error) {
@@ -482,12 +708,31 @@ export const Test = () => {
 
   return (
     <div className="my-4">
-      <Card title="API 接口测试">
+      <Card title={t('apiTest.title')} extra={
+        <Select
+          value={activeTab}
+          onChange={key => {
+            setActiveTab(key)
+            const fieldNames = testConfigs[key].fields.map(f => f.name)
+            form.resetFields(fieldNames)
+            setResult(null)
+            setSearchKeyword('')
+            setCurrentPage(1)
+          }}
+          style={{ width: 180 }}
+          options={Object.entries(testConfigs).map(([key, config]) => ({
+            value: key,
+            label: config.label,
+          }))}
+        />
+      }>
         <Tabs
           activeKey={activeTab}
           onChange={key => {
             setActiveTab(key)
-            form.resetFields()
+            // 只重置动态字段，保留 apiToken 选中状态
+            const fieldNames = testConfigs[key].fields.map(f => f.name)
+            form.resetFields(fieldNames)
             setResult(null)
             setSearchKeyword('')
             setCurrentPage(1)
@@ -507,21 +752,21 @@ export const Test = () => {
                 <div>
                   <div className="flex items-center gap-2 mb-2">
                     <Tag color="blue">{currentConfig.method}</Tag>
-                    <code className="text-sm bg-gray-100 px-2 py-1 rounded">
+                    <code className="text-sm bg-gray-100 dark:bg-gray-800 px-2 py-1 rounded">
                       {currentConfig.apiPath}
                     </code>
                   </div>
                   {currentConfig.fields.length > 0 && (
-                    <div className="text-xs text-gray-600">
-                      <div className="font-semibold mb-1">参数说明:</div>
+                    <div className="text-xs text-gray-600 dark:text-gray-400">
+                      <div className="font-semibold mb-1">{t('apiTest.paramDesc')}</div>
                       <div className="pl-2">
                         {currentConfig.fields.map(field => (
                           <div key={field.name} className="mb-1">
-                            <span className="font-mono text-blue-600">
+                            <span className="font-mono text-blue-600 dark:text-blue-400">
                               {field.label}
                             </span>
                             {' → '}
-                            <span className="text-gray-500">
+                            <span className="text-gray-500 dark:text-gray-400">
                               {field.apiParam || field.name}
                             </span>
                           </div>
@@ -549,7 +794,7 @@ export const Test = () => {
                 label={
                   <div className="flex items-center justify-between w-full">
                     <div className="flex items-center gap-2">
-                      <span>弹幕 Token</span>
+                      <span>{t('apiTest.danmakuToken')}</span>
                       <span className="text-xs text-gray-400 font-normal">
                         (token path)
                       </span>
@@ -561,28 +806,29 @@ export const Test = () => {
                       loading={tokensLoading}
                       className="p-0 h-auto"
                     >
-                      刷新
+                      {t('apiTest.refresh')}
                     </Button>
                   </div>
                 }
-                rules={[{ required: true, message: '请选择弹幕token' }]}
+                rules={[{ required: true, message: t('apiTest.selectToken') }]}
               >
                 <Select
                   placeholder={
                     tokens.length === 0
-                      ? '暂无可用 Token，请先创建'
-                      : '请选择弹幕token'
+                      ? t('apiTest.noTokenAvailable')
+                      : t('apiTest.selectToken')
                   }
                   loading={tokensLoading}
                   showSearch
                   optionFilterProp="searchLabel"
+                  onChange={val => localStorage.setItem(STORAGE_KEY, val)}
                   disabled={tokens.length === 0}
                   notFoundContent={
                     <div className="text-center p-4 text-gray-400">
-                      暂无可用 Token
+                      {t('apiTest.noToken')}
                       <br />
                       <span className="text-xs">
-                        请在 Token 管理页面创建
+                        {t('apiTest.createInTokenPage')}
                       </span>
                     </div>
                   }
@@ -595,7 +841,7 @@ export const Test = () => {
                           <span>{token.name}</span>
                           {token.expiresAt && (
                             <span className="text-xs text-gray-400">
-                              到期: {new Date(token.expiresAt).toLocaleDateString()}
+                              {t('apiTest.expireDate', { date: new Date(token.expiresAt).toLocaleDateString() })}
                             </span>
                           )}
                         </div>
@@ -629,10 +875,12 @@ export const Test = () => {
                         )}
                       </div>
                     }
+                    tooltip={field.tooltip}
+                    valuePropName={field.valuePropName || 'value'}
                     rules={[
                       {
                         required: field.required,
-                        message: `请输入${field.label}`,
+                        message: t('apiTest.inputFieldTip', { field: field.label }),
                       },
                     ]}
                   >
@@ -652,7 +900,7 @@ export const Test = () => {
                   loading={loading}
                   className="w-full h-11 text-base font-medium rounded-lg bg-primary hover:bg-primary/90 transition-all duration-300 transform hover:scale-[1.02] active:scale-[0.98]"
                 >
-                  测试
+                  {t('apiTest.test')}
                 </Button>
               </Form.Item>
             </Form>
@@ -661,11 +909,44 @@ export const Test = () => {
           {/* 结果区域（上下布局，全宽展示） */}
           {result && (
             <div className="mt-4 px-2">
-              <div className="text-sm text-gray-500 mb-2">测试结果:</div>
+              {/* 结果标题栏 + 视图切换开关 */}
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-sm text-gray-500 dark:text-gray-400">{t('apiTest.testResult')}</div>
+                {/* 药丸形视图切换开关 */}
+                <button
+                  type="button"
+                  onClick={() => setShowRaw(v => !v)}
+                  className={`
+                    flex items-center gap-1.5 px-1.5 py-1 rounded-full text-xs font-medium
+                    border transition-all duration-200 select-none cursor-pointer
+                    ${showRaw
+                      ? 'bg-blue-50 border-blue-200 text-blue-600 dark:bg-blue-950 dark:border-blue-700 dark:text-blue-400'
+                      : 'bg-gray-100 border-gray-200 text-gray-500 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400'
+                    }
+                  `}
+                >
+                  <span className={`transition-all duration-200 px-1.5 py-0.5 rounded-full text-xs ${!showRaw ? 'bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-200 shadow-sm' : ''}`}>
+                    {t('apiTest.formatted')}
+                  </span>
+                  {/* 滑块轨道 */}
+                  <div className={`relative w-8 h-4 rounded-full transition-colors duration-200 ${showRaw ? 'bg-blue-500' : 'bg-gray-300 dark:bg-gray-600'}`}>
+                    <div className={`absolute top-0.5 w-3 h-3 rounded-full bg-white shadow transition-all duration-200 ${showRaw ? 'left-[18px]' : 'left-0.5'}`} />
+                  </div>
+                  <span className={`transition-all duration-200 px-1.5 py-0.5 rounded-full text-xs ${showRaw ? 'bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-200 shadow-sm' : ''}`}>
+                    {t('apiTest.raw')}
+                  </span>
+                </button>
+              </div>
+
               <div className="p-4 bg-gray-50 dark:bg-gray-900 rounded">
-                {result.error ? (
+                {showRaw ? (
+                  /* 原始 JSON 展示 */
+                  <pre className="text-xs text-gray-700 dark:text-gray-300 overflow-auto max-h-[500px] whitespace-pre-wrap break-all leading-relaxed">
+                    {JSON.stringify(result, null, 2)}
+                  </pre>
+                ) : result.error ? (
                   <div className="text-red-600">
-                    <div className="font-bold">[错误]</div>
+                    <div className="font-bold">{t('apiTest.error')}</div>
                     <div className="mt-2">{result.message}</div>
                   </div>
                 ) : isListResult ? (
@@ -677,7 +958,7 @@ export const Test = () => {
                     {(currentConfig.getListData(result) || []).length > 0 && (
                       <div className="mt-2 mb-2 flex items-center gap-2">
                         <Input
-                          placeholder="搜索结果..."
+                          placeholder={t('apiTest.searchResultPlaceholder')}
                           prefix={<SearchOutlined className="text-gray-400" />}
                           allowClear
                           value={searchKeyword}
@@ -689,7 +970,7 @@ export const Test = () => {
                         />
                         {searchKeyword && (
                           <span className="text-xs text-gray-400 whitespace-nowrap">
-                            {totalFiltered} 条
+                            {t('apiTest.filteredCount', { count: totalFiltered })}
                           </span>
                         )}
                       </div>
@@ -703,7 +984,7 @@ export const Test = () => {
                         )
                       ) : (
                         <div className="text-gray-400 text-center py-4">
-                          {searchKeyword ? '没有匹配的结果' : '暂无数据'}
+                          {searchKeyword ? t('apiTest.noMatchResult') : t('apiTest.noData')}
                         </div>
                       )}
                     </div>

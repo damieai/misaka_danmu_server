@@ -44,7 +44,9 @@ async def full_refresh_task(sourceId: int, session: AsyncSession, scraper_manage
             raise ValueError(f"找不到源ID {sourceId} 的信息。")
 
         provider_name = source_info["providerName"]
+        media_id = source_info.get("mediaId", "?")
         scraper = scraper_manager.get_scraper(provider_name)
+        logger.info(f"全量刷新: provider={provider_name}, mediaId={media_id}")
 
         # 步骤 1: 从数据库获取已存储的分集列表（不依赖源站接口）
         await progress_callback(5, "正在获取已存储的分集列表...")
@@ -167,7 +169,7 @@ async def full_refresh_task(sourceId: int, session: AsyncSession, scraper_manage
         await progress_callback(98, "正在生成刷新报告...")
 
         episode_range_str = generate_episode_range_string(successful_indices)
-        final_message = f"全量刷新完成，处理了 {total_episodes} 个分集，新增 {total_comments_added} 条弹幕。"
+        final_message = f"全量刷新完成，处理了 {total_episodes} 个分集，共获取 {total_comments_added} 条弹幕。" if total_comments_added > 0 else f"全量刷新完成，处理了 {total_episodes} 个分集，暂无新弹幕。"
 
         if successful_indices:
             final_message += f"\n成功刷新: {len(successful_indices)} 集"
@@ -206,14 +208,73 @@ async def refresh_episode_task(episodeId: int, session: AsyncSession, manager: S
 
         provider_name = info["providerName"]
         provider_episode_id = info["providerEpisodeId"]
+        media_id = info.get("mediaId", "?")
 
         # 调试信息：检查获取到的信息
-        logger.info(f"刷新分集 {episodeId}: provider_name='{provider_name}', provider_episode_id='{provider_episode_id}'")
+        logger.info(f"刷新分集 {episodeId}: provider_name='{provider_name}', provider_episode_id='{provider_episode_id}', mediaId='{media_id}'")
 
         if not provider_name:
             raise ValueError(f"分集 {episodeId} 的 provider_name 为空")
         if not provider_episode_id:
             raise ValueError(f"分集 {episodeId} 的 provider_episode_id 为空")
+
+        # 检测 fallback 格式的 providerEpisodeId（格式: fallback_{provider}_{mediaId}_{episodeNumber}）
+        # 这种格式是匹配后备流程创建的，scraper 无法直接使用，需要重新解析
+        if provider_episode_id.startswith("fallback_"):
+            parts = provider_episode_id.split("_", 3)  # ['fallback', provider, mediaId, episodeNumber]
+            if len(parts) < 4:
+                logger.error(f"fallback providerEpisodeId 格式异常，无法解析: {provider_episode_id}")
+                raise TaskSuccess(f"刷新失败：fallback ID 格式异常: {provider_episode_id}")
+
+            fb_provider = parts[1]
+            fb_media_id = parts[2]
+            try:
+                fb_episode_number = int(parts[3])
+            except ValueError:
+                logger.error(f"fallback providerEpisodeId 集数部分非数字: {parts[3]}")
+                raise TaskSuccess(f"刷新失败：fallback ID 集数格式异常: {provider_episode_id}")
+
+            logger.info(f"检测到 fallback 格式 providerEpisodeId，解析: provider={fb_provider}, mediaId={fb_media_id}, episode={fb_episode_number}")
+
+            scraper = manager.get_scraper(fb_provider)
+            if not scraper:
+                logger.error(f"找不到 {fb_provider} 的 scraper，无法刷新")
+                raise TaskSuccess("刷新失败：找不到对应的弹幕源")
+
+            await progress_callback(15, "正在重新获取分集信息...")
+            try:
+                episodes_list = await scraper.get_episodes(fb_media_id)
+                if episodes_list:
+                    target_ep = next((ep for ep in episodes_list if ep.episodeIndex == fb_episode_number), None)
+                    if target_ep:
+                        provider_episode_id = target_ep.episodeId
+                        provider_name = fb_provider
+                        logger.info(f"已从分集列表解析到真实 vid: {provider_episode_id}")
+
+                        # 更新数据库中的 providerEpisodeId 为真实值，避免下次再解析
+                        from sqlalchemy import update
+                        await session.execute(
+                            update(orm_models.Episode)
+                            .where(orm_models.Episode.id == episodeId)
+                            .values(providerEpisodeId=provider_episode_id)
+                        )
+                        await session.flush()
+                    else:
+                        logger.warning(f"分集列表中未找到第 {fb_episode_number} 集")
+                        raise TaskSuccess(f"刷新失败：分集列表中未找到第 {fb_episode_number} 集")
+                else:
+                    logger.warning(f"从 {fb_provider} 获取分集列表为空: mediaId={fb_media_id}")
+                    raise TaskSuccess("刷新失败：获取分集列表为空")
+            except TaskSuccess:
+                raise
+            except Exception as e:
+                logger.error(f"解析 fallback providerEpisodeId 失败: {e}")
+                raise TaskSuccess(f"刷新失败：{e}")
+
+            # 二次校验：确保 provider_episode_id 已经被替换为真实值
+            if provider_episode_id.startswith("fallback_"):
+                logger.error(f"fallback 解析后 provider_episode_id 仍为占位符: {provider_episode_id}")
+                raise TaskSuccess("刷新失败：无法从源站获取真实的分集ID")
 
         scraper = manager.get_scraper(provider_name)
 
@@ -250,7 +311,7 @@ async def refresh_episode_task(episodeId: int, session: AsyncSession, manager: S
             all_comments_from_source = comments
 
         if not all_comments_from_source:
-            await crud.update_episode_fetch_time(session, episodeId)
+            # 不更新 fetched_at，保留旧时间戳，让下次请求仍能触发自动刷新
             raise TaskSuccess("未找到任何弹幕。")
 
 
@@ -264,7 +325,17 @@ async def refresh_episode_task(episodeId: int, session: AsyncSession, manager: S
         )
 
         await session.commit()
-        raise TaskSuccess(f"刷新完成，新增 {added_count} 条弹幕。")
+        if added_count > 0:
+            raise TaskSuccess(f"刷新完成，新增 {added_count} 条弹幕。")
+        else:
+            # 已成功从源抓到弹幕、只是数量未增加（save_danmaku_for_episode 会 return 0 且不更新时间戳）。
+            # 必须在此更新 fetchedAt，否则自动刷新的“距今超过阈值”判断永远成立，
+            # 会导致同一集被反复触发刷新、后台任务无限循环（见 comments.py 自动刷新逻辑）。
+            # 注意：与“完全没抓到弹幕”（上方 not all_comments_from_source 分支）区分——
+            # 那种情况刻意不更新时间戳以保留重试机会。
+            await crud.update_episode_fetch_time(session, episodeId)
+            await session.commit()
+            raise TaskSuccess("刷新完成，该分集暂无新弹幕。")
     except TaskSuccess:
         # 任务成功完成，直接重新抛出，由 TaskManager 处理
         raise
@@ -413,6 +484,10 @@ async def refresh_bulk_episodes_task(episodeIds: List[int], session: AsyncSessio
                     session, episode_id, all_comments_from_source, config_manager,
                     fire_threshold=scraper.likes_fire_threshold
                 )
+                # 若抓到弹幕但数量未增加（save 返回 0 且内部不更新时间戳），
+                # 仍需更新 fetchedAt，避免该集下次被自动刷新逻辑误判为“超期”反复触发。
+                if added_count == 0:
+                    await crud.update_episode_fetch_time(session, episode_id)
                 total_added_comments += added_count
                 success_episodes.append((episode_index, episode_id))
 
@@ -439,7 +514,8 @@ async def refresh_bulk_episodes_task(episodeIds: List[int], session: AsyncSessio
         success_ranges = format_episode_ranges(success_episodes)
         failed_ranges = format_episode_ranges(failed_episodes)
 
-        message = f"批量刷新完成，共处理 {total} 个，成功 {success_count} 个 {success_ranges}，失败 {failed_count} 个 {failed_ranges}，新增 {total_added_comments} 条弹幕。"
+        comment_part = f"共获取 {total_added_comments} 条弹幕" if total_added_comments > 0 else "暂无新弹幕"
+        message = f"批量刷新完成，共处理 {total} 个，成功 {success_count} 个 {success_ranges}，失败 {failed_count} 个 {failed_ranges}，{comment_part}。"
         raise TaskSuccess(message)
     except TaskSuccess:
         raise

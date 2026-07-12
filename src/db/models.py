@@ -42,6 +42,24 @@ class Comment(BaseModel):
 class CommentResponse(BaseModel):
     count: int = Field(..., description="弹幕总数")
     comments: List[Comment] = Field([], description="弹幕列表")
+    # 异步任务扩展字段（同步模式下均为 null，向后兼容）
+    status: Optional[str] = Field(None, description="任务状态: pending | completed | failed（同步模式为 null）")
+    taskId: Optional[str] = Field(None, description="异步任务ID（同步模式为 null）")
+    episodeId: Optional[int] = Field(None, description="关联的分集ID（轮询接口返回，客户端用此ID调 /comment/{episodeId} 获取弹幕）")
+    progress: Optional[int] = Field(None, description="任务进度 0-100")
+    description: Optional[str] = Field(None, description="任务描述/进度信息")
+
+
+
+class TaskCommentResponse(BaseModel):
+    """轮询接口专用响应模型，只返回有值的字段"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    status: str = Field(..., description="任务状态: pending | completed | failed")
+    taskId: str = Field(..., description="任务ID")
+    episodeId: Optional[int] = Field(None, description="关联的分集ID（任务完成后用此ID调 /comment/{episodeId} 获取弹幕）")
+    progress: Optional[int] = Field(None, description="任务进度 0-100")
+    description: Optional[str] = Field(None, description="任务进度描述")
 
 class DanmakuUpdateRequest(BaseModel):
     """用于覆盖弹幕的请求体模型"""
@@ -63,6 +81,7 @@ class ProviderSearchInfo(BaseModel):
     url: Optional[str] = Field(None, description="平台播放页面URL")
     supportsEpisodeUrls: Optional[bool] = Field(None, description="该源是否支持获取分集URL (用于补充源功能)")
     supplementSource: Optional[str] = Field(None, description="搜索补充源名称 (如 '360')，非补充结果时为null")
+    recognitionTitle: Optional[str] = Field(None, description="识别词指定的入库正确名（命中双向识别词时填充，前端用于展示识别词tag；None表示无识别词）")
 
 
 class ProviderSearchResponse(BaseModel):
@@ -313,6 +332,12 @@ class TokenAccessLog(BaseModel):
     status: str
     path: Optional[str] = None
     userAgent: Optional[str] = None
+    method: Optional[str] = None
+    requestHeaders: Optional[str] = None
+    requestBody: Optional[str] = None
+    responseHeaders: Optional[str] = None
+    responseBody: Optional[str] = None
+    statusCode: Optional[int] = None
 
 # --- 用户和认证模型 ---
 class UserBase(BaseModel):
@@ -337,6 +362,56 @@ class TokenData(BaseModel):
 class PasswordChange(BaseModel):
     oldPassword: str = Field(..., description="当前密码")
     newPassword: str = Field(..., min_length=8, description="新密码 (至少8位)")
+
+
+# --- MFA 模型 ---
+class MfaRequiredResponse(BaseModel):
+    """MFA 验证要求响应"""
+    detail: str = "MFA required"
+    mfaRequired: bool = True
+    mfaTypes: List[str] = Field(default_factory=list, description="可用的MFA类型: totp, passkey")
+
+class TotpSetupResponse(BaseModel):
+    """TOTP 设置响应（包含密钥和二维码URI）"""
+    secret: str = Field(..., description="TOTP 密钥 (base32)")
+    uri: str = Field(..., description="otpauth:// URI，用于生成二维码")
+
+class TotpVerifyRequest(BaseModel):
+    """TOTP 验证请求"""
+    code: str = Field(..., min_length=6, max_length=6, description="6位验证码")
+
+class TotpDisableRequest(BaseModel):
+    """关闭 TOTP 请求"""
+    password: str = Field(..., description="当前密码（安全确认）")
+
+class PassKeyInfo(BaseModel):
+    """PassKey 信息"""
+    id: int
+    deviceName: Optional[str] = None
+    createdAt: Optional[datetime] = None
+    lastUsedAt: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+class PassKeyRegisterRequest(BaseModel):
+    """PassKey 注册验证请求"""
+    credential: str = Field(..., description="浏览器返回的 WebAuthn 凭证 JSON")
+    deviceName: Optional[str] = Field(None, description="设备名称")
+
+class PassKeyAuthenticateRequest(BaseModel):
+    """PassKey 认证验证请求"""
+    credential: str = Field(..., description="浏览器返回的 WebAuthn 断言 JSON")
+
+class PassKeyRenameRequest(BaseModel):
+    """PassKey 重命名请求"""
+    deviceName: str = Field(..., description="新的设备名称")
+
+class MfaStatusResponse(BaseModel):
+    """MFA 状态响应"""
+    totpEnabled: bool = False
+    passkeyCount: int = 0
+    passkeys: List[PassKeyInfo] = Field(default_factory=list)
 
 class PaginatedCommentResponse(BaseModel):
     """用于UI弹幕列表分页的响应模型"""
@@ -440,6 +515,7 @@ class ScraperSettingWithConfig(ScraperSetting):
     isLoggable: bool
     logRawResponses: bool = False
     version: Optional[str] = None  # 弹幕源版本号
+    displayName: Optional[str] = None  # UI 友好显示名称，优先于 providerName
 
 class ProxySettingsResponse(BaseModel):
     proxyMode: str = "none"  # none, http_socks, accelerate
@@ -524,7 +600,11 @@ class ScheduledTaskInfo(ScheduledTaskCreate):
 class AvailableJobInfo(BaseModel):
     jobType: str
     name: str
+    name_en: str = ""
+    name_tw: str = ""
     description: str = ""
+    description_en: str = ""
+    description_tw: str = ""
     isSystemTask: bool = False
     configSchema: list = []
 

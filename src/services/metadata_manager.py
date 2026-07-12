@@ -45,6 +45,8 @@ class MetadataSourceManager:
         # 从数据库缓存所有源的持久设置。
         self.source_settings: Dict[str, Dict[str, Any]] = {}
         self.scraper_manager = scraper_manager
+        # 存储最后一次辅助搜索的单源耗时: [(provider_name, duration_ms, result_count), ...]
+        self.last_aux_search_timing: List[Tuple[str, float, int]] = []
         # 新增：为所有元数据源创建一个父级路由器
         self.router = APIRouter()
         # 季度映射器(延迟初始化)
@@ -181,161 +183,219 @@ class MetadataSourceManager:
     async def search_aliases_from_enabled_sources(self, keyword: str, user: models.User) -> Set[str]:
         """从所有已启用的辅助元数据源并发获取别名。"""
         # 修正：调用新的、更通用的方法，并只返回别名部分
-        aliases, _ = await self.search_supplemental_sources(keyword, user)
+        aliases, _, _ = await self.search_supplemental_sources(keyword, user)
         return aliases
 
-    async def search_supplemental_sources(self, keyword: str, user: models.User) -> Tuple[Set[str], List[models.ProviderSearchInfo]]:
+    async def search_supplemental_sources(self, keyword: str, user: models.User) -> Tuple[Set[str], List[models.ProviderSearchInfo], Dict[str, str]]:
         """
         从所有启用的辅助源（包括强制启用的）进行搜索。
-        返回一个元组：(别名集合, 补充搜索结果列表)
+        返回一个元组：(别名集合, 补充搜索结果列表, 标题→类型映射)
 
         优化：对于 TMDB/Bangumi 等源，搜索结果不包含完整别名，
         需要对前几个结果调用 get_details 获取完整别名（包括中文别名）。
         """
+        import time as _time
+
+        # 并行读取所有 provider 的 force_aux_search 配置（避免串行 await 阻塞）
+        enabled_providers = [
+            (provider, settings) for provider, settings in self.source_settings.items()
+            if settings.get('isEnabled')
+        ]
+
+        if not enabled_providers:
+            return set(), [], {}
+
+        # 并行读取 config
+        force_config_tasks = [
+            self._config_manager.get(f"{provider}_force_aux_search", "false")
+            for provider, _ in enabled_providers
+        ]
+        force_results = await asyncio.gather(*force_config_tasks)
+
         enabled_sources_settings = []
-        for provider, settings in self.source_settings.items():
-            if not settings.get('isEnabled'):
-                continue
-
-            force_enabled_str = await self._config_manager.get(f"{provider}_force_aux_search", "false")
+        for (provider, settings), force_enabled_str in zip(enabled_providers, force_results):
             force_enabled = force_enabled_str.lower() == 'true'
-
             if settings.get('isAuxSearchEnabled') or force_enabled:
                 enabled_sources_settings.append(settings)
 
         if not enabled_sources_settings:
             return set(), []
 
+        # 每个源独立流水线：搜索 → 需要时立即 get_details，各源之间并行
+        async def _source_pipeline(source_instance, provider, kw, usr):
+            """单个辅助源的完整流水线：搜索 + 按需获取详情"""
+            _start = _time.monotonic()
+            try:
+                if provider == 'tmdb':
+                    res = await source_instance.search(kw, usr, mediaType='multi')
+                else:
+                    res = await source_instance.search(kw, usr)
+            except Exception as e:
+                _dur = (_time.monotonic() - _start) * 1000
+                return provider, None, _dur, None, e
+
+            _search_dur = (_time.monotonic() - _start) * 1000
+
+            if not isinstance(res, list):
+                return provider, None, _search_dur, None, None
+
+            # 对需要获取详情的源（tmdb/tvdb/imdb），立即并行获取详情
+            detail_aliases = set()
+            detail_dur = 0.0
+            needs_detail_fetch = provider in ['tmdb', 'tvdb', 'imdb']
+            if needs_detail_fetch and res:
+                detail_tasks_local = []
+                max_detail_fetch = 3
+                detail_count = 0
+                for item in res:
+                    if detail_count >= max_detail_fetch:
+                        break
+                    has_aliases = bool(item.aliasesCn or item.aliasesJp or item.nameJp or item.nameEn)
+                    if not has_aliases:
+                        media_type = item.type if hasattr(item, 'type') and item.type else 'tv'
+                        detail_tasks_local.append(source_instance.get_details(item.id, usr, mediaType=media_type))
+                        detail_count += 1
+
+                if detail_tasks_local:
+                    _detail_start = _time.monotonic()
+                    detail_results = await asyncio.gather(*detail_tasks_local, return_exceptions=True)
+                    detail_dur = (_time.monotonic() - _detail_start) * 1000
+                    for detail_res in detail_results:
+                        if isinstance(detail_res, models.MetadataDetailsResponse):
+                            if detail_res.aliasesCn:
+                                detail_aliases.update(detail_res.aliasesCn)
+                            if detail_res.aliasesJp:
+                                detail_aliases.update(detail_res.aliasesJp)
+                            if detail_res.nameJp:
+                                detail_aliases.add(detail_res.nameJp)
+                            if detail_res.nameEn:
+                                detail_aliases.add(detail_res.nameEn)
+                            if detail_res.nameRomaji:
+                                detail_aliases.add(detail_res.nameRomaji)
+
+            total_dur = (_time.monotonic() - _start) * 1000  # noqa: F841
+            return provider, res, _search_dur, (detail_aliases, detail_dur), None
+
         tasks = []
         for source_setting in enabled_sources_settings:
             provider = source_setting['providerName']
             if source_instance := self.sources.get(provider):
-                # 优化：为 TMDB 使用 multi 搜索，一次性搜索 tv 和 movie
-                if provider == 'tmdb':
-                    tasks.append(source_instance.search(keyword, user, mediaType='multi'))
-                else:
-                    # 对于其他源，正常调用
-                    tasks.append(source_instance.search(keyword, user))
+                tasks.append(_source_pipeline(source_instance, provider, keyword, user))
             else:
                 self.logger.warning(f"已启用的元数据源 '{provider}' 未被成功加载，跳过辅助搜索。")
 
         if not tasks:
-            return set(), []
+            return set(), [], {}
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        pipeline_results = await asyncio.gather(*tasks)
 
         all_aliases: Set[str] = set()
         supplemental_results: List[models.ProviderSearchInfo] = []
+        # 标题→类型映射：用于帮助弹幕源修正媒体类型
+        title_type_map: Dict[str, str] = {}
+        self.last_aux_search_timing = []
 
-        # 收集需要获取详情的任务（用于获取完整别名）
-        detail_tasks = []
-        detail_task_info = []  # 记录每个任务对应的 (provider_name, source_instance, item)
-
-        for i, res in enumerate(results):
-            # 优化：现在每个源只产生一个任务，直接使用索引获取 provider_name
-            provider_name = enabled_sources_settings[i]['providerName'] if i < len(enabled_sources_settings) else 'unknown'
-            source_instance = self.sources.get(provider_name)
-
-            if isinstance(res, list):
-                self.logger.info(f"辅助源 '{provider_name}' 为关键词 '{keyword}' 找到了 {len(res)} 个结果。")
-
-                # 对于 TMDB/TVDB/IMDB 等源，搜索结果不包含完整别名
-                # 需要对前几个结果调用 get_details 获取完整别名
-                # 注意：Bangumi 的 search 方法内部已经调用了 get_details，不需要再次获取
-                needs_detail_fetch = provider_name in ['tmdb', 'tvdb', 'imdb']
-                detail_fetch_count = 0
-                max_detail_fetch = 3  # 最多获取前3个结果的详情
-
-                for item in res:
-                    all_aliases.add(item.title)
-
-                    # 添加中文别名
-                    if item.aliasesCn:
-                        all_aliases.update(item.aliasesCn)
-
-                    # 添加日文别名列表
-                    if item.aliasesJp:
-                        all_aliases.update(item.aliasesJp)
-
-                    # 添加单个日文别名
-                    if item.nameJp:
-                        all_aliases.add(item.nameJp)
-
-                    # 添加英文别名
-                    if item.nameEn:
-                        all_aliases.add(item.nameEn)
-
-                    # 添加罗马音别名
-                    if item.nameRomaji:
-                        all_aliases.add(item.nameRomaji)
-
-                    # 如果搜索结果没有别名，且源支持获取详情，则添加到详情获取队列
-                    if needs_detail_fetch and source_instance and detail_fetch_count < max_detail_fetch:
-                        # 检查是否已经有别名（如果有就不需要再获取详情）
-                        has_aliases = bool(item.aliasesCn or item.aliasesJp or item.nameJp or item.nameEn)
-                        if not has_aliases:
-                            # 确定 mediaType
-                            media_type = item.type if hasattr(item, 'type') and item.type else 'tv'
-                            detail_tasks.append(source_instance.get_details(item.id, user, mediaType=media_type))
-                            detail_task_info.append((provider_name, item))
-                            detail_fetch_count += 1
-
-                    # 如果是 'douban' 或 '360'，则将其结果添加到补充列表中
-                    if provider_name in ['douban', '360']:
-                        # 构建补充结果,包含extra字段用于传递原始数据
-                        supp_info = models.ProviderSearchInfo(
-                            provider=provider_name, mediaId=item.id, title=item.title,
-                            type=item.type if hasattr(item, 'type') and item.type else 'unknown',
-                            season=1,
-                            year=item.year if hasattr(item, 'year') else None,
-                            imageUrl=item.imageUrl,
-                            supportsEpisodeUrls=item.supportsEpisodeUrls  # 传递是否支持分集URL的标志
-                        )
-                        supplemental_results.append(supp_info)
-            elif isinstance(res, Exception):
-                if isinstance(res, httpx.ConnectError):
-                    self.logger.warning(f"无法连接到元数据源 '{provider_name}'。请检查网络连接或代理设置。")
-                elif isinstance(res, (httpx.TimeoutException, httpx.ReadTimeout)):
-                    self.logger.warning(f"连接元数据源 '{provider_name}' 超时。")
+        for provider_name, res, search_dur, detail_info, error in pipeline_results:
+            if error:
+                self.last_aux_search_timing.append((provider_name, search_dur, 0))
+                if isinstance(error, httpx.ConnectError):
+                    self.logger.warning(f"无法连接到元数据源 '{provider_name}'。({search_dur:.0f}ms)")
+                elif isinstance(error, (httpx.TimeoutException, httpx.ReadTimeout)):
+                    self.logger.warning(f"连接元数据源 '{provider_name}' 超时。({search_dur:.0f}ms)")
                 else:
-                    self.logger.error(f"元数据源 '{provider_name}' 的辅助搜索子任务失败: {res}", exc_info=False)
+                    self.logger.error(f"元数据源 '{provider_name}' 辅助搜索失败: {error} ({search_dur:.0f}ms)", exc_info=False)
+                continue
 
-        # 并行获取详情以获取完整别名
-        if detail_tasks:
-            self.logger.info(f"正在获取 {len(detail_tasks)} 个搜索结果的详情以获取完整别名...")
-            detail_results = await asyncio.gather(*detail_tasks, return_exceptions=True)
+            if not res:
+                self.last_aux_search_timing.append((provider_name, search_dur, 0))
+                continue
 
-            for j, detail_res in enumerate(detail_results):
-                if isinstance(detail_res, models.MetadataDetailsResponse):
-                    provider_name, original_item = detail_task_info[j]
+            # 计算总耗时（搜索 + 详情获取）
+            total_provider_dur = search_dur
+            detail_alias_count = 0
+            if detail_info:
+                _, detail_dur = detail_info
+                if detail_dur > 0:
+                    total_provider_dur = search_dur + detail_dur
+                detail_alias_count = len(detail_info[0]) if detail_info[0] else 0
 
-                    # 添加详情中的别名
-                    if detail_res.aliasesCn:
-                        self.logger.debug(f"从 {provider_name} 详情获取到中文别名: {detail_res.aliasesCn}")
-                        all_aliases.update(detail_res.aliasesCn)
-                    if detail_res.aliasesJp:
-                        all_aliases.update(detail_res.aliasesJp)
-                    if detail_res.nameJp:
-                        all_aliases.add(detail_res.nameJp)
-                    if detail_res.nameEn:
-                        all_aliases.add(detail_res.nameEn)
-                    if detail_res.nameRomaji:
-                        all_aliases.add(detail_res.nameRomaji)
-                elif isinstance(detail_res, Exception):
-                    provider_name, _ = detail_task_info[j]
-                    self.logger.debug(f"获取 {provider_name} 详情失败: {detail_res}")
+            self.last_aux_search_timing.append((provider_name, total_provider_dur, len(res)))
+            self.logger.info(f"辅助源 '{provider_name}' 为关键词 '{keyword}' 找到了 {len(res)} 个结果, {detail_alias_count} 个别名。({total_provider_dur:.0f}ms)")
 
-        return {alias for alias in all_aliases if alias}, supplemental_results
+            # 收集别名 + 构建标题→类型映射
+            for item in res:
+                # 标准化 type：TMDB 返回 "tv"，统一为 "tv_series"
+                item_type = item.type if hasattr(item, 'type') and item.type else None
+                if item_type == 'tv':
+                    item_type = 'tv_series'
+
+                all_aliases.add(item.title)
+                if item_type:
+                    title_type_map[item.title] = item_type
+                if item.aliasesCn:
+                    all_aliases.update(item.aliasesCn)
+                    if item_type:
+                        for alias in item.aliasesCn:
+                            title_type_map[alias] = item_type
+                if item.aliasesJp:
+                    all_aliases.update(item.aliasesJp)
+                if item.nameJp:
+                    all_aliases.add(item.nameJp)
+                if item.nameEn:
+                    all_aliases.add(item.nameEn)
+                if item.nameRomaji:
+                    all_aliases.add(item.nameRomaji)
+
+                # 补充列表
+                if provider_name in ['douban', '360']:
+                    supp_info = models.ProviderSearchInfo(
+                        provider=provider_name, mediaId=item.id, title=item.title,
+                        type=item.type if hasattr(item, 'type') and item.type else 'unknown',
+                        season=1,
+                        year=item.year if hasattr(item, 'year') else None,
+                        imageUrl=item.imageUrl,
+                        supportsEpisodeUrls=item.supportsEpisodeUrls
+                    )
+                    supplemental_results.append(supp_info)
+
+            # 合并详情获取的别名
+            if detail_info:
+                detail_aliases, detail_dur = detail_info
+                if detail_aliases:
+                    all_aliases.update(detail_aliases)
+
+        # A2 匹配增强：用 bangumi-data 本地离线索引补充多语言别名（日↔中↔英），离线零网络成本
+        # 受 bangumiDataOfflineEnabled 开关控制：关闭时仅用在线 API，不走离线库
+        try:
+            offline_enabled = (await self._config_manager.get("bangumiDataOfflineEnabled", "true")).lower() == "true"
+            if offline_enabled:
+                from src.services.bangumi_data_manager import get_bangumi_data_manager
+                bgm_data = get_bangumi_data_manager()
+                if bgm_data is not None:
+                    local = await bgm_data.get_aliases_by_title(keyword)
+                    if local:
+                        if local.get("name_jp"):
+                            all_aliases.add(local["name_jp"])
+                        if local.get("name_en"):
+                            all_aliases.add(local["name_en"])
+                        for cn in (local.get("aliases_cn") or []):
+                            all_aliases.add(cn)
+        except Exception as e:
+            self.logger.debug(f"bangumi-data 本地别名补充失败: {e}")
+
+        return {alias for alias in all_aliases if alias}, supplemental_results, title_type_map
 
     async def supplement_empty_search_results(
         self,
         keyword: str,
         empty_providers: Set[str]
     ) -> List[models.ProviderSearchInfo]:
-        """调用所有启用的搜索补充源，为返回空结果的弹幕源提供兜底搜索结果。
+        """调用所有启用的搜索补充源，并行请求后统一汇总结果。
 
-        遍历 is_search_supplement_source=True 且已启用的元数据源，
-        调用其 supplement_search() 获取补全条目。
+        流程：
+        1. 收集所有已启用的补充源
+        2. 并行调用各补充源的 supplement_search()
+        3. 汇总去重后返回
 
         Args:
             keyword: 搜索关键词
@@ -348,13 +408,26 @@ class MetadataSourceManager:
             return []
 
         supplement_sources = []
+        # 先筛选候选补充源
+        candidate_sources = []
         for provider_name, source in self.sources.items():
             if not getattr(source, 'is_search_supplement_source', False):
                 continue
             if not self.source_settings.get(provider_name, {}).get('isEnabled'):
                 continue
-            # 从 config 表读取补充源开关（key 与 configurable_fields 声明一致）
-            enabled_str = await self._config_manager.get(f"{provider_name}_searchSupplementEnabled", "false")
+            candidate_sources.append((provider_name, source))
+
+        if not candidate_sources:
+            return []
+
+        # 并行读取所有补充源的开关配置
+        config_tasks = [
+            self._config_manager.get(f"{pn}_searchSupplementEnabled", "false")
+            for pn, _ in candidate_sources
+        ]
+        config_results = await asyncio.gather(*config_tasks)
+
+        for (provider_name, source), enabled_str in zip(candidate_sources, config_results):
             if enabled_str.lower() == 'true':
                 supplement_sources.append(source)
 
@@ -362,21 +435,36 @@ class MetadataSourceManager:
             return []
 
         user = models.User(id=0, username="system")
-        remaining_empty = set(empty_providers)
-        all_supplements: List[models.ProviderSearchInfo] = []
 
-        # 逐个调用补充源（后续可改为并发）
-        for source in supplement_sources:
-            if not remaining_empty:
-                break
+        # 并行调用所有补充源，带计时
+        import time as _time
+        async def _call_source(source):
+            _start = _time.monotonic()
             try:
-                results = await source.supplement_search(keyword, remaining_empty, user)
-                if results:
-                    all_supplements.extend(results)
-                    # 更新: 已有补全结果的弹幕源不再需要后续补充源补全
-                    remaining_empty -= {r.provider for r in results}
+                results = await source.supplement_search(keyword, empty_providers, user)
+                _dur = (_time.monotonic() - _start) * 1000
+                return source.provider_name, results, _dur
             except Exception as e:
+                _dur = (_time.monotonic() - _start) * 1000
                 self.logger.warning(f"搜索补充源 '{source.provider_name}' 调用失败: {e}")
+                return source.provider_name, [], _dur
+
+        timed_list = await asyncio.gather(*[_call_source(s) for s in supplement_sources])
+
+        # 记录各补充源耗时
+        self.last_supplement_timing = [
+            (name, dur, len(results)) for name, results, dur in timed_list
+        ]
+
+        # 汇总去重
+        all_supplements: List[models.ProviderSearchInfo] = []
+        seen_ids: Set[str] = set()
+        for _, results, _ in timed_list:
+            for item in results:
+                unique_id = (item.provider, item.mediaId)
+                if unique_id not in seen_ids:
+                    all_supplements.append(item)
+                    seen_ids.add(unique_id)
 
         return all_supplements
 
@@ -564,29 +652,39 @@ class MetadataSourceManager:
             return await source_instance.execute_action(action_name, payload, user, request=request)
         raise HTTPException(status_code=404, detail=f"未找到元数据源: {provider}")
 
+    def get_config_keys(self, providerName: str) -> list:
+        """从源类的 config_keys 属性获取用户可配置的 key 列表。
+
+        优先从元数据源类读取，如果不存在则检查 scraper 等其他注册源。
+        """
+        source_class = self._source_classes.get(providerName)
+        if source_class:
+            return list(getattr(source_class, 'config_keys', []))
+        # scraper 等非元数据源的兼容 fallback（如 gamer）
+        scraper_keys_map = {
+            "gamer": ["gamerCookie", "gamerUserAgent", "gamerEpisodeBlacklistRegex", "scraperGamerLogResponses"],
+        }
+        return scraper_keys_map.get(providerName, [])
+
+    def get_bool_config_keys(self, providerName: str) -> list:
+        """从源类的 bool_config_keys 属性获取需要布尔转换的 key 列表。"""
+        source_class = self._source_classes.get(providerName)
+        if source_class:
+            return list(getattr(source_class, 'bool_config_keys', []))
+        return []
+
     async def getProviderConfig(self, providerName: str) -> Dict[str, Any]:
         """
         获取特定提供商（元数据源或搜索源）的配置。
+        config keys 从源类的 config_keys 属性自动获取，无需在此硬编码。
         """
 
-        # 将提供商名称映射到其在数据库中的配置键
-        config_keys_map = {
-            # Metadata Sources
-            "tmdb": ["tmdbApiKey", "tmdbApiBaseUrl", "tmdbImageBaseUrl"],
-            "bangumi": ["bangumiClientId", "bangumiClientSecret", "bangumiToken", "authMode"],
-            "douban": ["doubanCookie"],
-            "tvdb": ["tvdbApiKey"],
-            "imdb": ["imdbUseApi", "imdbEnableFallback"],  # IMDb 配置
-            # Scrapers
-            "gamer": ["gamerCookie", "gamerUserAgent", "gamerEpisodeBlacklistRegex", "scraperGamerLogResponses"],
-        }
+        keys_to_fetch = self.get_config_keys(providerName)
+        bool_keys = set(self.get_bool_config_keys(providerName))
 
-        keys_to_fetch = config_keys_map.get(providerName)
-
-        # 如果提供商没有特定的配置键，检查它是否是一个已知的提供商
-        if keys_to_fetch is None:
+        if not keys_to_fetch:
+            # 没有声明 config_keys，检查是否是已知的源
             is_known_metadata_source = providerName in self.sources
-            # 修正：即使没有特定配置键，只要是已知的元数据源，就继续执行
             if is_known_metadata_source:
                 config_values = {}
             else:
@@ -595,8 +693,7 @@ class MetadataSourceManager:
             config_values = {}
             for key in keys_to_fetch:
                 value_str = await self._config_manager.get(key, "")
-                # 对于IMDB的布尔值配置,转换为布尔类型
-                if key in ['imdbUseApi', 'imdbEnableFallback']:
+                if key in bool_keys:
                     config_values[key] = value_str.lower() == 'true' if value_str else True
                 else:
                     config_values[key] = value_str
@@ -744,6 +841,141 @@ class MetadataSourceManager:
     async def get_seasons(self, *args, **kwargs):
         """委托给 SeasonMapper.get_seasons_from_source()"""
         return await self.season_mapper.get_seasons_from_source(*args, **kwargs)
+
+    async def get_all_calendars(self, user: models.User, force_refresh: bool = False) -> Dict[str, List[Dict[str, Any]]]:
+        """从所有已启用的元数据源获取日历数据（三层架构）。
+
+        架构说明：
+            Layer 1: 内存/Redis 缓存（region=external_calendar，TTL 2h）
+            Layer 2: 持久化表 external_calendar_item（24h 内有效）
+            Layer 3: 调用 metadata source 的 get_calendar()，结果双写表+缓存
+
+        :param force_refresh: 跳过 L1/L2 缓存，强制走外部源重新拉取（用于「同步日程」按钮）
+        :return: { "bangumi": [...], "trakt": [...] } 仅包含实际有数据的源
+        """
+        from src.db.crud import external_calendar as ec_crud
+
+        CACHE_REGION = "external_calendar"
+        CACHE_KEY = "weekly_all"
+        CACHE_TTL = 2 * 60 * 60   # 2 小时
+        TABLE_MAX_AGE_HOURS = 24  # 表数据 24h 内视为有效
+
+        # ---- Layer 1: 内存/Redis 缓存 ----
+        if not force_refresh:
+            try:
+                cached = await self.cache_manager.get(CACHE_REGION, CACHE_KEY)
+                if cached:
+                    self.logger.debug("get_all_calendars: cache HIT (L1)")
+                    return cached
+            except Exception as e:
+                self.logger.debug(f"L1 缓存读取失败（忽略）: {e}")
+
+        # ---- Layer 2: 数据库表 ----
+        if not force_refresh:
+            try:
+                async with self._session_factory() as session:
+                    grouped = await ec_crud.get_all_fresh(session, max_age_hours=TABLE_MAX_AGE_HOURS)
+                if grouped:
+                    self.logger.debug(f"get_all_calendars: table HIT (L2) providers={list(grouped.keys())}")
+                    # 回填 L1 缓存（不阻塞返回）
+                    try:
+                        await self.cache_manager.set(CACHE_REGION, CACHE_KEY, grouped, ttl_seconds=CACHE_TTL)
+                    except Exception as e:
+                        self.logger.debug(f"L1 缓存回填失败（忽略）: {e}")
+                    return grouped
+            except Exception as e:
+                self.logger.warning(f"L2 表读取失败，回退到外部源: {e}")
+
+        # ---- Layer 3: 调用外部 API（与原逻辑保持一致） ----
+        results: Dict[str, List[Dict[str, Any]]] = {}
+
+        async def _fetch(provider_name: str, source_instance):
+            try:
+                items = await source_instance.get_calendar(user)
+                if items:
+                    return provider_name, items
+            except Exception as e:
+                self.logger.warning(f"获取 {provider_name} 日历失败: {e}")
+            return provider_name, []
+
+        tasks = []
+        for provider_name, setting in self.source_settings.items():
+            if not setting.get('isEnabled'):
+                continue
+            source = self.sources.get(provider_name)
+            if source and hasattr(source, 'get_calendar'):
+                tasks.append(_fetch(provider_name, source))
+
+        if tasks:
+            fetched = await asyncio.gather(*tasks, return_exceptions=True)
+            for item in fetched:
+                if isinstance(item, Exception):
+                    continue
+                name, items = item
+                if items:
+                    results[name] = items
+
+        # ---- 双写：持久化到表 + 写缓存 ----
+        if results:
+            # 写表（按 provider 分别 upsert）
+            try:
+                async with self._session_factory() as session:
+                    for provider_name, items in results.items():
+                        await ec_crud.upsert_items(session, provider_name, items)
+                self.logger.info(f"get_all_calendars: 已持久化 {sum(len(v) for v in results.values())} 条到 external_calendar_item 表")
+            except Exception as e:
+                self.logger.warning(f"L2 表写入失败（不影响返回）: {e}")
+
+            # 同步「平台用户私人在追状态」（OAuth 账号下的 watching/wish/done 等）
+            # 这个调用是可选的：未授权时各源会自动跳过返回 {}
+            try:
+                await self.sync_user_platform_status(user)
+                # 平台状态写入后，重新从表读取以保证返回的 results 含最新状态
+                async with self._session_factory() as session:
+                    refreshed = await ec_crud.get_all_fresh(session, max_age_hours=TABLE_MAX_AGE_HOURS)
+                if refreshed:
+                    results = refreshed
+            except Exception as e:
+                self.logger.warning(f"同步平台用户状态失败（不影响返回）: {e}")
+
+            # 写 L1 缓存
+            try:
+                await self.cache_manager.set(CACHE_REGION, CACHE_KEY, results, ttl_seconds=CACHE_TTL)
+            except Exception as e:
+                self.logger.debug(f"L1 缓存写入失败（忽略）: {e}")
+
+        return results
+
+    async def sync_user_platform_status(self, user: models.User) -> Dict[str, int]:
+        """同步「平台账号下我的在追/想看」状态到 external_calendar_item 表。
+
+        遍历所有已启用的元数据源，如果该源实现了 get_user_watching_collection，
+        则拉取用户在该平台的私人收藏状态，并 Upsert 到表中（仅更新 platformWatchStatus 等字段）。
+
+        :return: { provider_name: updated_rows_count }
+        """
+        from src.db.crud import external_calendar as ec_crud
+
+        result: Dict[str, int] = {}
+        for provider_name, setting in self.source_settings.items():
+            if not setting.get("isEnabled"):
+                continue
+            source = self.sources.get(provider_name)
+            if not source or not hasattr(source, "get_user_watching_collection"):
+                continue
+            try:
+                statuses = await source.get_user_watching_collection(user)
+                if not statuses:
+                    continue
+                async with self._session_factory() as session:
+                    updated = await ec_crud.update_platform_status(session, provider_name, statuses)
+                result[provider_name] = updated
+                self.logger.info(
+                    f"sync_user_platform_status: provider={provider_name} 拉取 {len(statuses)} 条，更新 {updated} 行"
+                )
+            except Exception as e:
+                self.logger.warning(f"sync_user_platform_status 调用 {provider_name} 失败: {e}")
+        return result
 
     async def close_all(self):
         """在应用关闭时关闭所有元数据源客户端。"""

@@ -2,6 +2,7 @@
 用户相关的CRUD操作
 """
 
+import hashlib
 import logging
 import secrets
 from datetime import timedelta
@@ -9,8 +10,10 @@ from typing import Optional, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 
-from ..orm_models import User, BangumiAuth, OauthState
+from ..orm_models import User, BangumiAuth, OauthState, OauthCredential
 from src.core.timezone import get_now
+from src.core import settings
+from src.utils.otp import encrypt_otp_secret, decrypt_otp_secret
 from .. import models
 
 logger = logging.getLogger(__name__)
@@ -32,11 +35,17 @@ async def get_user_by_username(session: AsyncSession, username: str) -> Optional
     result = await session.execute(stmt)
     user = result.scalar_one_or_none()
     if user:
+        # 透明解密 OTP Secret（兼容旧版明文数据）
+        otp_secret = user.otpSecret
+        if otp_secret:
+            otp_secret = decrypt_otp_secret(otp_secret, settings.jwt.secret_key)
         return {
             "id": user.id,
             "username": user.username,
             "hashedPassword": user.hashedPassword,
-            "token": user.token
+            "token": user.token,
+            "isOtp": user.isOtp,
+            "otpSecret": otp_secret,
         }
     return None
 
@@ -62,10 +71,30 @@ async def update_user_password(session: AsyncSession, username: str, new_hashed_
 
 
 async def update_user_login_info(session: AsyncSession, username: str, token: str):
-    """更新用户的最后登录时间和当前令牌"""
+    """更新用户的最后登录时间和当前令牌（存储 SHA256 摘要而非明文 token）"""
+    token_hash = hashlib.sha256(token.encode()).hexdigest()[:32]
     stmt = update(User).where(User.username == username).values(
-        token=token,
+        token=token_hash,
         tokenUpdate=get_now()
+    )
+    await session.execute(stmt)
+    await session.commit()
+
+
+async def enable_user_otp(session: AsyncSession, username: str, otp_secret: str):
+    """为用户启用 TOTP 两步验证（加密存储 OTP Secret）"""
+    encrypted_secret = encrypt_otp_secret(otp_secret, settings.jwt.secret_key)
+    stmt = update(User).where(User.username == username).values(
+        isOtp=True, otpSecret=encrypted_secret
+    )
+    await session.execute(stmt)
+    await session.commit()
+
+
+async def disable_user_otp(session: AsyncSession, username: str):
+    """为用户关闭 TOTP 两步验证"""
+    stmt = update(User).where(User.username == username).values(
+        isOtp=False, otpSecret=None
     )
     await session.execute(stmt)
     await session.commit()
@@ -158,4 +187,68 @@ async def delete_bangumi_auth(session: AsyncSession, user_id: int) -> bool:
         await session.commit()
         return True
     return False
+
+
+
+# --- Generic OAuth Credential Management ---
+
+async def get_oauth_credential(session: AsyncSession, user_id: int, provider: str) -> Dict[str, Any]:
+    """获取用户在某平台的 OAuth 授权状态。"""
+    from sqlalchemy import and_
+    stmt = select(OauthCredential).where(
+        and_(OauthCredential.userId == user_id, OauthCredential.provider == provider)
+    )
+    cred = (await session.execute(stmt)).scalar_one_or_none()
+    if cred:
+        return {
+            "isAuthenticated": True,
+            "provider": cred.provider,
+            "providerUsername": cred.providerUsername,
+            "providerUserId": cred.providerUserId,
+            "expiresAt": cred.expiresAt,
+            "authorizedAt": cred.authorizedAt,
+        }
+    return {"isAuthenticated": False, "provider": provider}
+
+
+async def save_oauth_credential(session: AsyncSession, user_id: int, provider: str, data: Dict[str, Any]):
+    """保存或更新某平台的 OAuth 授权信息。"""
+    from sqlalchemy import and_
+    stmt = select(OauthCredential).where(
+        and_(OauthCredential.userId == user_id, OauthCredential.provider == provider)
+    )
+    cred = (await session.execute(stmt)).scalar_one_or_none()
+    if cred:
+        for key, value in data.items():
+            if hasattr(cred, key):
+                setattr(cred, key, value)
+    else:
+        data["userId"] = user_id
+        data["provider"] = provider
+        new_cred = OauthCredential(**data)
+        session.add(new_cred)
+    await session.commit()
+
+
+async def delete_oauth_credential(session: AsyncSession, user_id: int, provider: str) -> bool:
+    """删除某平台的 OAuth 授权信息。"""
+    from sqlalchemy import and_
+    stmt = select(OauthCredential).where(
+        and_(OauthCredential.userId == user_id, OauthCredential.provider == provider)
+    )
+    cred = (await session.execute(stmt)).scalar_one_or_none()
+    if cred:
+        await session.delete(cred)
+        await session.commit()
+        return True
+    return False
+
+
+async def get_oauth_credential_with_token(session: AsyncSession, user_id: int, provider: str) -> Optional[OauthCredential]:
+    """获取完整的 OAuth 凭证对象（含 token），用于 API 调用。"""
+    from sqlalchemy import and_
+    stmt = select(OauthCredential).where(
+        and_(OauthCredential.userId == user_id, OauthCredential.provider == provider)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
 

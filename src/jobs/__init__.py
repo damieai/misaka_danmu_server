@@ -6,6 +6,9 @@ from .refresh_latest_episode import RefreshLatestEpisodeJob
 from .tmdb_auto_map import TmdbAutoMapJob
 from .webhook_processor import WebhookProcessorJob
 from .danmaku_cleanup import DanmakuCleanupJob
+from .fill_missing_episodes import FillMissingEpisodesJob
+from .watchlist_sync import WatchlistSyncJob
+from .schedule_sync import ScheduleSyncJob
 
 __all__ = [
     'BaseJob',
@@ -16,4 +19,7 @@ __all__ = [
     'TmdbAutoMapJob',
     'WebhookProcessorJob',
     'DanmakuCleanupJob',
+    'FillMissingEpisodesJob',
+    'WatchlistSyncJob',
+    'ScheduleSyncJob',
 ]

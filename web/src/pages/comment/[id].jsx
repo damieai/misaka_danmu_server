@@ -4,8 +4,10 @@ import { getDanmakuDetail, getEpisodes } from '../../apis'
 import { Breadcrumb, Card, Empty } from 'antd'
 import { HomeOutlined } from '@ant-design/icons'
 import { useScroll } from '../../hooks/useScroll'
+import { useTranslation } from 'react-i18next'
 
 export const CommentDetail = () => {
+  const { t } = useTranslation()
   const { id } = useParams()
   const [searchParams] = useSearchParams()
   const episodeId = searchParams.get('episodeId')
@@ -41,8 +43,6 @@ export const CommentDetail = () => {
     canLoadMore: !loadingMore && commentList.length < pagination.total,
     onLoadMore: handleLoadMore,
   })
-
-  console.log(!loadingMore, commentList.length, pagination.total)
 
   /**
    * 获取弹幕详情
@@ -112,7 +112,7 @@ export const CommentDetail = () => {
             ),
           },
           {
-            title: <Link to="/library">弹幕库</Link>,
+            title: <Link to="/library">{t('commentPage.breadcrumbLibrary')}</Link>,
           },
           {
             title: (
@@ -120,16 +120,16 @@ export const CommentDetail = () => {
                 style={{ cursor: 'pointer', color: '#1890ff' }}
                 onClick={() => navigate(-1)}
               >
-                分集列表
+                {t('commentPage.breadcrumbEpisodeList')}
               </span>
             ),
           },
           {
-            title: '弹幕列表',
+            title: t('commentPage.pageTitleLabel'),
           },
         ]}
       />
-      <Card loading={loading} title={`弹幕列表: ${episode?.title ?? ''}`}>
+      <Card loading={loading} title={t('commentPage.cardTitle', { title: episode?.title ?? '' })}>
         <div>
           {!!commentList?.length ? (
             <>
@@ -165,12 +165,12 @@ export const CommentDetail = () => {
                     color: '#999',
                   }}
                 >
-                  {loadingMore ? '正在加载更多...' : '下拉加载更多'}
+                  {loadingMore ? t('commentPage.loadingMore') : t('commentPage.pullToLoad')}
                 </div>
               )}
             </>
           ) : (
-            <Empty description="暂无弹幕" />
+            <Empty description={t('commentPage.noComments')} />
           )}
         </div>
       </Card>

@@ -14,6 +14,22 @@ logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 5
 
+# MarkdownV2 保留字符，进度文本需转义以避免 edit 解析失败导致刷屏
+_MDV2_SPECIAL = r'_*[]()~`>#+-=|{}.!'
+
+
+def _escape_mdv2(text: str) -> str:
+    """转义 Telegram MarkdownV2 保留字符。"""
+    if not text:
+        return ""
+    out = []
+    for ch in str(text):
+        if ch in _MDV2_SPECIAL:
+            out.append('\\' + ch)
+        else:
+            out.append(ch)
+    return ''.join(out)
+
 
 class SearchMenuMixin:
     """处理 /search 命令及编辑导入子流程的所有 cmd_/cb_/_text_ 方法"""
@@ -43,11 +59,11 @@ class SearchMenuMixin:
                 success=False,
                 text=(
                     "请提供搜索关键词。\n\n"
-                    "用法: /search <关键词>\n"
+                    "用法: /sh <关键词>\n"
                     "示例:\n"
-                    "  /search 刀剑神域 — 搜索并整季导入\n"
-                    "  /search 刀剑神域 S01 — 指定第1季导入\n"
-                    "  /search 刀剑神域 S01E10 — 仅导入第1季第10集"
+                    "  /sh 刀剑神域 — 搜索并整季导入\n"
+                    "  /sh 刀剑神域 S01 — 指定第1季导入\n"
+                    "  /sh 刀剑神域 S01E10 — 仅导入第1季第10集"
                 ),
                 reply_markup=[
                     [
@@ -79,7 +95,10 @@ class SearchMenuMixin:
             desc = _desc_map.get(description, description)
             filled = int(progress / 10)
             bar = "█" * filled + "░" * (10 - filled)
-            text = f"`[{bar}]` {progress}%\n• {desc}"
+            # 进度条用反引号 code 包裹（█░ 不含保留字符）；百分比与描述需转义，
+            # 否则 desc 中的 "..." 等保留字符会导致 MarkdownV2 解析失败 →
+            # edit 失败降级发新消息 → 进度刷屏。
+            text = f"`[{bar}]` {_escape_mdv2(str(progress) + '%')}\n• {_escape_mdv2(desc)}"
             msg_id_out: list = []
             await channel.send_message(
                 title="🔍 搜索中",
@@ -99,12 +118,17 @@ class SearchMenuMixin:
                     search_term=keyword,
                     session=session,
                     scraper_manager=self.scraper_manager,
+                    metadata_manager=self.metadata_manager,
+                    use_alias_filtering=False,
                     use_title_filtering=True,
                     use_source_priority_sorting=True,
                     progress_callback=_search_progress,
                 )
             if not results:
-                return CommandResult(text=f"🔍 未找到与「{keyword}」相关的结果。")
+                return CommandResult(
+                    text=f"🔍 未找到与「{keyword}」相关的结果。",
+                    edit_message_id=edit_mid[0],
+                )
             serialized = []
             for r in results:
                 if hasattr(r, 'model_dump'):
@@ -137,33 +161,28 @@ class SearchMenuMixin:
                 suffix += f"E{parsed_episode}"
             display_keyword = keyword + suffix if suffix else keyword
             edit_mid[0] = edit_mid[0] or kw.get("edit_message_id")
-            return self._build_search_page(serialized, display_keyword, 0, edit_message_id=edit_mid[0])
+            return await self._build_search_page(serialized, display_keyword, 0, edit_message_id=edit_mid[0])
         except Exception as e:
             logger.error(f"搜索失败: {e}", exc_info=True)
-            return CommandResult(success=False, text=f"搜索出错: {e}")
+            return CommandResult(success=False, text=f"搜索出错: {e}", edit_message_id=edit_mid[0])
 
-    def _build_search_page(self, results: list, keyword: str, page: int,
+    async def _build_search_page(self, results: list, keyword: str, page: int,
                            edit_message_id: int = None,
                            parsed_season=None, parsed_episode=None) -> CommandResult:
         total = len(results)
-        start = page * PAGE_SIZE
-        end = min(start + PAGE_SIZE, total)
+        page_size = 10  # 每页 10 条（2行×5个按钮）
+        start = page * page_size
+        end = min(start + page_size, total)
         page_items = results[start:end]
-        total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+        total_pages = max(1, (total + page_size - 1) // page_size)
 
         lines = [f"🔍 搜索「{keyword}」({start+1}-{end}/{total}):\n"]
-        buttons = []
         articles = []
         for i, r in enumerate(page_items):
             idx = start + i
             year_str = f" ({r['year']})" if r.get('year') else ""
             ep_str = f" {r.get('episodeCount', '?')}集" if r.get('episodeCount') else ""
             lines.append(f"{idx+1}. [{r['provider']}] {r['title']}{year_str}{ep_str}")
-            # 每条结果只显示「选择」按钮，点击后进入操作面板
-            buttons.append([{
-                "text": f"🎯 选择 {idx+1}",
-                "callback_data": f"search_select:{idx}",
-            }])
             articles.append({
                 "title": f"{idx+1}. {r['title']}{year_str}{ep_str}",
                 "description": f"[{r['provider']}]  回复 {idx+1} 导入",
@@ -171,6 +190,16 @@ class SearchMenuMixin:
                 "url": "",
             })
 
+        # 按钮：1-5 第一行，6-10 第二行
+        buttons = []
+        for row_start in range(0, len(page_items), 5):
+            row = []
+            for i in range(row_start, min(row_start + 5, len(page_items))):
+                idx = start + i
+                row.append({"text": str(idx + 1), "callback_data": f"search_select:{idx}"})
+            buttons.append(row)
+
+        # 第三行：翻页
         nav = []
         if page > 0:
             nav.append({"text": "⬅️ 上一页", "callback_data": f"search_page:{page-1}"})
@@ -179,19 +208,65 @@ class SearchMenuMixin:
         if nav:
             buttons.append(nav)
 
+        # 生成当前页的聚合海报图（带序号），失败则回退为文字+单图模式
+        collage = await self._build_page_collage(page_items, start)
+
         return CommandResult(
             text="\n".join(lines),
             reply_markup=buttons,
             edit_message_id=edit_message_id,
             articles=articles,
+            image_bytes=collage,
         )
+
+    async def _build_page_collage(self, page_items: list, start: int):
+        """为当前页结果生成带序号的九宫格海报图。
+
+        受配置开关 telegramSearchPosterCollage 控制（默认开启）。
+        任何异常都吞掉并返回 None，保证搜索结果正常文字展示不受影响。
+        """
+        try:
+            cfg = getattr(self, "config_manager", None)
+            if cfg is not None:
+                enabled = await cfg.get("telegramSearchPosterCollage", "true")
+                if str(enabled).lower() != "true":
+                    return None
+            # 至少要有一项带海报才值得聚合
+            if not any(it.get("imageUrl") for it in page_items):
+                return None
+
+            # 读取代理配置（与 image_utils 下载逻辑保持一致）
+            proxy, ssl_verify = await self._get_proxy_for_collage()
+
+            from src.utils.poster_collage import build_poster_collage
+            items = [
+                {"imageUrl": it.get("imageUrl") or "", "index": start + i + 1}
+                for i, it in enumerate(page_items)
+            ]
+            return await build_poster_collage(items, proxy=proxy, ssl_verify=ssl_verify)
+        except Exception as e:
+            logger.warning(f"生成搜索结果聚合海报失败（不影响文字结果）: {e}")
+            return None
+
+    async def _get_proxy_for_collage(self):
+        """读取全局代理配置，返回 (proxy_url 或 None, ssl_verify)。"""
+        try:
+            cfg = getattr(self, "config_manager", None)
+            if cfg is None:
+                return None, True
+            proxy_enabled = (await cfg.get("proxyEnabled", "false")).lower() == "true"
+            proxy_url = await cfg.get("proxyUrl", "")
+            ssl_verify = (await cfg.get("proxySslVerify", "true")).lower() == "true"
+            return (proxy_url if (proxy_enabled and proxy_url) else None), ssl_verify
+        except Exception:
+            return None, True
 
     async def cb_search_page(self, params, user_id, channel, **kw):
         page = int(params[0]) if params else 0
         conv = self.get_conversation(user_id)
         if not conv or conv.state != "search_results":
             return CommandResult(text="", answer_callback_text="搜索已过期，请重新搜索")
-        return self._build_search_page(
+        return await self._build_search_page(
             conv.data.get("results", []),
             conv.data.get("keyword", ""),
             page,
@@ -200,11 +275,12 @@ class SearchMenuMixin:
 
     def _build_select_panel(self, item: dict, idx: int, parsed_season=None,
                              parsed_episode=None, edit_message_id=None) -> CommandResult:
-        """构建单条搜索结果的操作面板"""
+        """构建单条搜索结果的操作面板（有海报时发送图文新消息）"""
         title = item.get("title", "未知")
         provider = item.get("provider", "未知源")
         year_str = f" ({item['year']})" if item.get('year') else ""
         ep_str = f" {item.get('episodeCount', '?')}集" if item.get('episodeCount') else ""
+        image_url = item.get("imageUrl") or ""
         text = (
             f"🎯 *已选择目标*\n"
             f"• 标题: {title}{year_str}\n"
@@ -212,28 +288,36 @@ class SearchMenuMixin:
             f"请选择导入方式："
         )
         if parsed_episode is not None:
-            # 场景3：带季集
             s = f"S{parsed_season:02d}" if parsed_season is not None else "S01"
             e_label = f"{s}E{parsed_episode:02d}" if isinstance(parsed_episode, int) else f"{s}E{parsed_episode}"
             action_row = [
+                {"text": "✏️ 编辑导入", "callback_data": f"search_edit:{idx}"},
                 {"text": f"📥 导入 {e_label}", "callback_data": f"search_import:{idx}"},
-                {"text": "✏️ 编辑", "callback_data": f"search_edit:{idx}"},
             ]
         elif parsed_season is not None:
-            # 场景2：带季
             action_row = [
-                {"text": f"📥 整季导入 S{parsed_season:02d}", "callback_data": f"search_import:{idx}"},
-                {"text": "🎯 单集导入", "callback_data": f"search_ep_input:{idx}"},
-                {"text": "✏️ 编辑", "callback_data": f"search_edit:{idx}"},
+                {"text": "✏️ 编辑导入", "callback_data": f"search_edit:{idx}"},
+                {"text": f"📥 导入 S{parsed_season:02d}", "callback_data": f"search_import:{idx}"},
             ]
         else:
-            # 场景1：纯关键词
             action_row = [
-                {"text": "📥 整季导入", "callback_data": f"search_import:{idx}"},
-                {"text": "📅 指定季", "callback_data": f"search_season_input:{idx}"},
-                {"text": "✏️ 编辑", "callback_data": f"search_edit:{idx}"},
+                {"text": "✏️ 编辑导入", "callback_data": f"search_edit:{idx}"},
+                {"text": "📥 直接导入", "callback_data": f"search_import:{idx}"},
             ]
         back_row = [{"text": "⬅️ 返回列表", "callback_data": "search_back:0"}]
+
+        # 有海报图片时：不 edit 已有消息，发送新的图文消息
+        if image_url:
+            return CommandResult(
+                text=text,
+                reply_markup=[action_row, back_row],
+                articles=[{
+                    "title": f"{title}{year_str}",
+                    "description": f"[{provider}]{ep_str}",
+                    "picurl": image_url,
+                    "url": "",
+                }],
+            )
         return CommandResult(
             text=text,
             reply_markup=[action_row, back_row],
@@ -267,7 +351,7 @@ class SearchMenuMixin:
         conv = self.get_conversation(user_id)
         if not conv or conv.state != "search_results":
             return CommandResult(text="", answer_callback_text="搜索已过期，请重新搜索")
-        return self._build_search_page(
+        return await self._build_search_page(
             conv.data.get("results", []),
             conv.data.get("keyword", ""),
             page,
@@ -635,7 +719,7 @@ class SearchMenuMixin:
         self.set_conversation(user_id, "search_results", snapshot,
                               chat_id=kw.get("chat_id"))
         keyword = snapshot.get("keyword", "")
-        return self._build_search_page(
+        return await self._build_search_page(
             snapshot["results"], keyword, 0,
             edit_message_id=kw.get("message_id"),
         )

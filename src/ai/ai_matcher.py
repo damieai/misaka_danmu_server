@@ -154,6 +154,7 @@ class AIMatcher:
         self.base_url = config.get("ai_match_base_url")
         self.model = config.get("ai_match_model")
         self.log_raw_response = config.get("ai_log_raw_response", False)
+        self.thinking_enabled = config.get("ai_thinking_enabled", False)
 
         # 提示词配置: 直接使用传入的配置,不做任何兜底处理
         # 注意: 硬编码的DEFAULT_*_PROMPT只用于初始化数据库,不用于运行时兜底
@@ -307,6 +308,25 @@ class AIMatcher:
                 "topped_up_balance": str(data.get("topped_up_balance", "0.00"))
             }
 
+    def _get_deepseek_thinking_extra(self) -> dict:
+        """当 provider 为 deepseek 且启用思考模式时，返回 extra_body 参数。"""
+        if self.provider == "deepseek" and self.thinking_enabled:
+            return {"extra_body": {"thinking": {"type": "enabled"}}}
+        return {}
+
+    def _log_reasoning_content(self, response, method_name: str):
+        """记录 DeepSeek 思考模式的 reasoning_content 到日志。"""
+        if not self.log_raw_response:
+            return
+        try:
+            reasoning = getattr(response.choices[0].message, 'reasoning_content', None)
+            if reasoning:
+                ai_responses_logger.info(
+                    f"[{method_name}] 思考内容 (reasoning_content):\n{reasoning}\n{'='*80}"
+                )
+        except Exception:
+            pass
+
     def _initialize_client(self):
         """根据提供商初始化客户端"""
         try:
@@ -352,7 +372,9 @@ class AIMatcher:
         self,
         query: Dict[str, Any],
         results: List[ProviderSearchInfo],
-        favorited_info: Optional[Dict[str, bool]] = None
+        favorited_info: Optional[Dict[str, bool]] = None,
+        existing_info: Optional[Dict[str, bool]] = None,
+        recognition_info: Optional[Dict[str, bool]] = None
     ) -> Optional[int]:
         """
         使用AI从搜索结果中选择最佳匹配
@@ -361,6 +383,9 @@ class AIMatcher:
             query: 查询信息,包含 title, season, episode, year 等
             results: 搜索结果列表
             favorited_info: 精确标记信息 {provider:mediaId -> isFavorited}
+            existing_info: 库内已有源信息 {provider:mediaId -> inLibrary}
+            recognition_info: 识别词命中信息 {provider:mediaId -> matchesRecognitionRule}
+                （仅作认知校正，标记该结果经识别词规则转换后即用户目标作品，不改变排序优先级）
 
         Returns:
             最佳匹配结果的索引,如果没有合适的匹配则返回None
@@ -381,6 +406,18 @@ class AIMatcher:
                     key = f"{result.provider}:{result.mediaId}"
                     is_favorited = favorited_info.get(key, False)
 
+                # 检查是否已存在于库内（供 AI 优先复用库内源，避免同剧不同集换源）
+                in_library = False
+                if existing_info:
+                    key = f"{result.provider}:{result.mediaId}"
+                    in_library = existing_info.get(key, False)
+
+                # 检查是否命中识别词规则（认知校正：该结果经识别词转换后即用户目标作品）
+                matches_recognition = False
+                if recognition_info:
+                    key = f"{result.provider}:{result.mediaId}"
+                    matches_recognition = recognition_info.get(key, False)
+
                 results_data.append({
                     "index": idx,
                     "provider": result.provider,
@@ -389,7 +426,9 @@ class AIMatcher:
                     "season": result.season,
                     "year": result.year,
                     "episodeCount": result.episodeCount,
-                    "isFavorited": is_favorited
+                    "isFavorited": is_favorited,
+                    "inLibrary": in_library,
+                    "matchesRecognitionRule": matches_recognition
                 })
 
             # 尝试从缓存获取
@@ -433,6 +472,14 @@ class AIMatcher:
                     f"根据TMDB剧集组映射，S{cs}E{ce}(剧集组分季)等价于S{ts}E{te}(TMDB标准分季)，"
                     f"该季度共{total}集。请优先选择集数接近{total}集或标题包含第{cs}季相关信息的弹幕源。"
                 )
+
+            # 识别词认知校正提示：告诉 AI 哪些结果命中了用户的识别词规则及其真实身份。
+            # why：识别词把源站标题(如"说唱巅峰对决2026")映射为入库名(如"中国新说唱 第九季")，
+            # AI 若不知道这层映射，可能因标题字面差异误判 matchesRecognitionRule=true 的正确结果。
+            # 注意：此为身份理解辅助，不改变排序优先级（标记/库内/源顺序优先级不变）。
+            rec_hint = query.get("recognition_hint")
+            if rec_hint:
+                input_data["recognition_hint"] = rec_hint
 
             logger.info(f"AI匹配: 开始分析 {len(results)} 个搜索结果")
             logger.debug(f"查询信息: {query}")
@@ -521,9 +568,11 @@ class AIMatcher:
                 ],
                 temperature=0.0,
                 response_format={"type": "json_object"},
-                timeout=30
+                timeout=30,
+                **self._get_deepseek_thinking_extra()
             )
 
+            self._log_reasoning_content(response, "select_best_match")
             content = _extract_openai_content(response)
             if content is None:
                 return None
@@ -748,9 +797,11 @@ class AIMatcher:
                 ],
                 temperature=0.0,
                 response_format={"type": "json_object"},
-                timeout=30
+                timeout=30,
+                **self._get_deepseek_thinking_extra()
             )
 
+            self._log_reasoning_content(response, "recognize_title")
             content = _extract_openai_content(response)
             if content is None:
                 return None
@@ -940,9 +991,11 @@ class AIMatcher:
                 ],
                 temperature=0.0,
                 response_format={"type": "json_object"},
-                timeout=30
+                timeout=30,
+                **self._get_deepseek_thinking_extra()
             )
 
+            self._log_reasoning_content(response, "expand_aliases")
             content = _extract_openai_content(response)
             if content is None:
                 return None
@@ -1073,8 +1126,10 @@ class AIMatcher:
                     ],
                     temperature=0.0,
                     response_format={"type": "json_object"},
-                    timeout=30
+                    timeout=30,
+                    **self._get_deepseek_thinking_extra()
                 )
+                self._log_reasoning_content(response, "validate_aliases")
                 content = _extract_openai_content(response)
                 if content is None:
                     return None
@@ -1329,8 +1384,11 @@ class AIMatcher:
                     ],
                     temperature=0.0,
                     response_format={"type": "json_object"},
-                    timeout=30
+                    timeout=30,
+                    **self._get_deepseek_thinking_extra()
                 )
+                self._log_reasoning_content(response, "metadata_match")
+                content = _extract_openai_content(response)
 
             if self.log_raw_response:
                 ai_responses_logger.info(f"[元数据匹配] 原始响应: {content}")
@@ -1401,8 +1459,10 @@ class AIMatcher:
                         {"role": "user", "content": prompt}
                     ],
                     temperature=0.1,
-                    **_get_max_tokens_param(self.model, 50)
+                    **_get_max_tokens_param(self.model, 50),
+                    **self._get_deepseek_thinking_extra()
                 )
+                self._log_reasoning_content(response, "season_match")
                 content = _extract_openai_content(response)
                 if content is None:
                     return None
@@ -1529,8 +1589,10 @@ class AIMatcher:
                     ],
                     temperature=0.0,
                     response_format={"type": "json_object"},
-                    timeout=30
+                    timeout=30,
+                    **self._get_deepseek_thinking_extra()
                 )
+                self._log_reasoning_content(response, "episode_group_select")
                 content = _extract_openai_content(response)
                 if content is None:
                     logger.warning(f"剧集组选择(AI): '{title}' → AI返回空内容")
@@ -1674,8 +1736,10 @@ class AIMatcher:
                         {"role": "user", "content": user_prompt}
                     ],
                     temperature=0.0,
-                    **_get_max_tokens_param(self.model, 4096)
+                    **_get_max_tokens_param(self.model, 4096),
+                    **self._get_deepseek_thinking_extra()
                 )
+                self._log_reasoning_content(response, "generate_regex")
                 content = _extract_openai_content(response)
 
             if not content:

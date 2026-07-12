@@ -5,7 +5,7 @@ import {
   LockOutlined,
   ReloadOutlined,
 } from '@ant-design/icons'
-import { Button, Card, Input, message, Modal, Space } from 'antd'
+import { Button, Card, Input, message, Modal, Space, Typography } from 'antd'
 import { useEffect, useState } from 'react'
 import { getControlApiKey, refreshControlApiKey } from '../../../apis'
 import { useModal } from '../../../ModalContext'
@@ -13,8 +13,10 @@ import { useMessage } from '../../../MessageContext'
 import copy from 'copy-to-clipboard'
 import { useAtomValue } from 'jotai'
 import { isMobileAtom } from '../../../../store'
+import { useTranslation } from 'react-i18next'
 
 export const ApiKey = () => {
+  const { t } = useTranslation()
   const [apikey, setApikey] = useState('')
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
@@ -37,19 +39,19 @@ export const ApiKey = () => {
 
   const onRefresh = () => {
     modalApi.confirm({
-      title: '刷新API key',
+      title: t('control.apiKeyRefreshTitle'),
       zIndex: 1002,
-      content: <div>您确定要重新生成外部API密钥吗？旧的密钥将立即失效。</div>,
-      okText: '确认',
-      cancelText: '取消',
+      content: <div>{t('control.apiKeyRefreshConfirm')}</div>,
+      okText: t('control.apiKeyConfirm'),
+      cancelText: t('control.apiKeyCancel'),
       onOk: async () => {
         try {
           setRefreshing(true)
           const res = await refreshControlApiKey()
           setApikey(res.data.value ?? '')
-          messageApi.success('新的API密钥已生成！')
+          messageApi.success(t('control.apiKeyGenerated'))
         } catch (error) {
-          messageApi.error(`生成失败: ${error.message}`)
+          messageApi.error(t('control.apiKeyGenerateFailed', { msg: error.message }))
         } finally {
           setRefreshing(false)
         }
@@ -59,9 +61,12 @@ export const ApiKey = () => {
 
   return (
     <div className="my-6">
-      <Card title="外部API密钥" loading={loading}>
+      <Card title={t('control.apiKeyCardTitle')} loading={loading}>
         <div className="mb-4">
-          此密钥用于所有 /api/control/* 接口的鉴权。请妥善保管，不要泄露。
+          {t('control.apiKeyDescPrefix')} <Typography.Text code>/api/control/*</Typography.Text> {t('control.apiKeyDescMid')} <Typography.Text code>/api/mcp</Typography.Text> {t('control.apiKeyDescSuffix')}
+          <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+            {t('control.apiKeyAuthPrefix')} <Typography.Text code>?api_key=key</Typography.Text> {t('control.apiKeyAuthMid')} <Typography.Text code>X-API-KEY: key</Typography.Text> {t('control.apiKeyAuthSuffix')}
+          </div>
         </div>
         {isMobile ? (
           <div className="space-y-3">
@@ -69,7 +74,7 @@ export const ApiKey = () => {
               <div className="text-sm mb-2 font-medium">API Key:</div>
               <Input.Password
                 prefix={<LockOutlined className="text-gray-400" />}
-                placeholder="未生成，请点击下方按钮生成"
+                placeholder={t('control.apiKeyPlaceholderEmpty')}
                 visibilityToggle={{
                   visible: showKey,
                   onVisibleChange: setShowkey,
@@ -89,11 +94,11 @@ export const ApiKey = () => {
                 icon={<CopyOutlined />}
                 onClick={() => {
                   copy(apikey)
-                  messageApi.success('复制成功')
+                  messageApi.success(t('control.apiKeyCopySuccess'))
                 }}
                 block
               >
-                复制
+                {t('control.apiKeyCopy')}
               </Button>
               <Button
                 loading={refreshing}
@@ -102,7 +107,7 @@ export const ApiKey = () => {
                 onClick={onRefresh}
                 block
               >
-                刷新
+                {t('control.apiKeyRefresh')}
               </Button>
             </div>
           </div>
@@ -113,7 +118,7 @@ export const ApiKey = () => {
               <Space.Compact style={{ width: '100%' }}>
                 <Input.Password
                   prefix={<LockOutlined className="text-gray-400" />}
-                  placeholder="未生成，请点击右侧按钮生成。"
+                  placeholder={t('control.apiKeyPlaceholderEmptyRight')}
                   visibilityToggle={{
                     visible: showKey,
                     onVisibleChange: setShowkey,
@@ -132,10 +137,10 @@ export const ApiKey = () => {
                   icon={<CopyOutlined />}
                   onClick={() => {
                     copy(apikey)
-                    messageApi.success('复制成功')
+                    messageApi.success(t('control.apiKeyCopySuccess'))
                   }}
                 >
-                  复制
+                  {t('control.apiKeyCopy')}
                 </Button>
                 <Button
                   loading={refreshing}
@@ -143,7 +148,7 @@ export const ApiKey = () => {
                   icon={<ReloadOutlined />}
                   onClick={onRefresh}
                 >
-                  刷新
+                  {t('control.apiKeyRefresh')}
                 </Button>
               </Space.Compact>
             </div>

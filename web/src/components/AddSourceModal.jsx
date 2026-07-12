@@ -1,25 +1,42 @@
-import { Form, Input, Modal, Select, message } from 'antd'
-import { useState } from 'react'
-import { addSourceToAnime } from '../apis'
+import { Form, Input, Modal, Select } from 'antd'
+import { useState, useEffect } from 'react'
+import { useTranslation } from 'react-i18next'
+import { addSourceToAnime, getScrapers } from '../apis'
 import { useMessage } from '../MessageContext'
 import { MyIcon } from '@/components/MyIcon'
 import { generateRandomStr } from '../utils/data'
 
-// 通用数据源列表，将来可以从后端动态获取
-const PROVIDER_OPTIONS = [
-  { value: 'custom', label: '自定义 (Custom)' },
-  { value: 'bilibili', label: 'Bilibili' },
-  { value: 'tencent', label: '腾讯视频 (Tencent)' },
-  { value: 'iqiyi', label: '爱奇艺 (iQiyi)' },
-  { value: 'youku', label: '优酷 (Youku)' },
-  { value: 'mgtv', label: '芒果TV (MGTV)' },
-  { value: 'renren', label: '人人视频' },
-]
-
 export const AddSourceModal = ({ open, animeId, onCancel, onSuccess }) => {
+  const { t } = useTranslation()
   const [form] = Form.useForm()
   const [loading, setLoading] = useState(false)
+  const [providerOptions, setProviderOptions] = useState([
+    { value: 'custom', label: t('addSource.custom') },
+  ])
   const messageApi = useMessage()
+
+  // 弹窗打开时动态加载已注册的弹幕源列表
+  useEffect(() => {
+    if (!open) return
+    const loadProviders = async () => {
+      try {
+        const res = await getScrapers()
+        const scraperList = res.data || []
+        const dynamicOptions = scraperList.map(s => ({
+          value: s.providerName,
+          label: s.displayName || s.providerName,
+        }))
+        // "自定义" 始终在最前
+        setProviderOptions([
+          { value: 'custom', label: t('addSource.custom') },
+          ...dynamicOptions,
+        ])
+      } catch {
+        // 加载失败时保留默认的 custom 选项
+      }
+    }
+    loadProviders()
+  }, [open])
 
   const handleOk = async () => {
     if (!animeId) return
@@ -29,13 +46,13 @@ export const AddSourceModal = ({ open, animeId, onCancel, onSuccess }) => {
       // 修正：将 animeId 和表单值合并成一个对象再传递
       const res = await addSourceToAnime({ ...values, animeId })
       if (res.data) {
-        messageApi.success('数据源添加成功！')
+        messageApi.success(t('addSource.addSuccess'))
         onSuccess(res.data) // 将新创建的数据源信息传递回去
         form.resetFields()
       }
     } catch (error) {
       console.error('添加数据源失败:', error)
-      messageApi.error(error.detail || '添加数据源失败，请检查日志')
+      messageApi.error(error.detail || t('addSource.addFailed'))
     } finally {
       setLoading(false)
     }
@@ -43,7 +60,7 @@ export const AddSourceModal = ({ open, animeId, onCancel, onSuccess }) => {
 
   return (
     <Modal
-      title="添加数据源"
+      title={t('addSource.title')}
       open={open}
       onOk={handleOk}
       onCancel={onCancel}
@@ -58,24 +75,24 @@ export const AddSourceModal = ({ open, animeId, onCancel, onSuccess }) => {
       >
         <Form.Item
           name="providerName"
-          label="数据源平台"
-          rules={[{ required: true, message: '请选择平台！' }]}
+          label={t('addSource.platform')}
+          rules={[{ required: true, message: t('addSource.selectPlatform') }]}
           initialValue="custom"
         >
           <Select
             showSearch
-            options={PROVIDER_OPTIONS}
-            placeholder="选择一个平台"
+            options={providerOptions}
+            placeholder={t('addSource.selectPlatformPlaceholder')}
           />
         </Form.Item>
         <Form.Item
           name="mediaId"
-          label="媒体ID"
-          rules={[{ required: true, message: '请输入媒体ID！' }]}
-          help="对于'自定义'源，可填写任意唯一标识，如'manual-1'。"
+          label={t('addSource.mediaId')}
+          rules={[{ required: true, message: t('addSource.inputMediaId') }]}
+          help={t('addSource.mediaIdHelp')}
         >
           <Input
-            placeholder="例如：ss28235"
+            placeholder={t('addSource.mediaIdPlaceholder')}
             addonAfter={
               <div
                 className="cursor-pointer"

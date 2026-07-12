@@ -18,20 +18,32 @@ from src.ai.ai_prompts import DEFAULT_AI_MATCH_PROMPT, DEFAULT_AI_RECOGNITION_PR
 class TmdbAutoMapJob(BaseJob):
     job_type = "tmdbAutoScrape"
     job_name = "TMDB自动刮削与剧集组映射"
+    job_name_en = "TMDB Auto-Scrape & Episode Group Mapping"
+    job_name_tw = "TMDB自動刮削與劇集組對映"
     description = "自动从TMDB刮削已导入作品的别名、剧集组信息，更新分集映射关系。帮助解决分集顺序不一致的问题。"
+    description_en = "Auto-scrape aliases and episode group info from TMDB for imported works, updating episode mappings. Helps resolve episode order inconsistencies."
+    description_tw = "自動從TMDB刮削已匯入作品的別名、劇集組資訊，更新分集對映關係。幫助解決分集順序不一致的問題。"
     config_schema = [
         {
             "key": "forceScrape",
             "label": "强制刮削",
+            "label_en": "Force Scrape",
+            "label_tw": "強制刮削",
             "type": "boolean",
             "description": "关闭时，已有剧集组映射的条目将被跳过；开启时，强制覆盖所有条目的刮削数据",
+            "description_en": "When off, entries with existing episode group mappings are skipped; when on, force overwrite all entries.",
+            "description_tw": "關閉時，已有劇集組對映的條目將被跳過；開啟時，強制覆蓋所有條目的刮削資料",
             "default": False,
         },
         {
             "key": "enableEpisodeGroup",
             "label": "剧集组刮削",
+            "label_en": "Episode Group Scraping",
+            "label_tw": "劇集組刮削",
             "type": "boolean",
             "description": "开启后将从TMDB获取剧集组信息并更新分集映射关系；关闭时仅刮削别名信息",
+            "description_en": "When enabled, fetches episode group info from TMDB and updates mappings; when disabled, only scrapes alias info.",
+            "description_tw": "開啟後將從TMDB取得劇集組資訊並更新分集對映關係；關閉時僅刮削別名資訊",
             "default": False,
         },
     ]
@@ -97,8 +109,24 @@ class TmdbAutoMapJob(BaseJob):
         except Exception as e:
             self.logger.warning(f"初始化AI matcher失败: {e}, 将使用传统搜索")
 
-        # 获取所有作品(TV系列和电影/剧场版)
-        from src.db.orm_models import Anime, AnimeMetadata
+        # 获取所有作品(TV系列和电影/剧场版)，同时带出别名信息用于增量跳过判断
+        from src.db.orm_models import Anime, AnimeMetadata, AnimeAlias
+        from sqlalchemy import func, case, or_
+        # 子查询：检查是否存在任意非空别名
+        has_alias_subq = (
+            select(
+                AnimeAlias.animeId,
+                case(
+                    (or_(
+                        AnimeAlias.nameEn.isnot(None),
+                        AnimeAlias.nameJp.isnot(None),
+                        AnimeAlias.aliasCn1.isnot(None),
+                    ), True),
+                    else_=False
+                ).label("hasAlias")
+            )
+            .subquery()
+        )
         stmt = (
             select(
                 Anime.id.label("animeId"),
@@ -106,9 +134,11 @@ class TmdbAutoMapJob(BaseJob):
                 Anime.year,
                 Anime.type,
                 AnimeMetadata.tmdbId,
-                AnimeMetadata.tmdbEpisodeGroupId
+                AnimeMetadata.tmdbEpisodeGroupId,
+                func.coalesce(has_alias_subq.c.hasAlias, False).label("hasAlias")
             )
             .outerjoin(AnimeMetadata, Anime.id == AnimeMetadata.animeId)
+            .outerjoin(has_alias_subq, Anime.id == has_alias_subq.c.animeId)
             .where(Anime.type.in_(['tv_series', 'movie']))
         )
         result = await session.execute(stmt)
@@ -134,13 +164,20 @@ class TmdbAutoMapJob(BaseJob):
             self.logger.info(f"正在处理: '{title}' (Anime ID: {anime_id}, TMDB ID: {tmdb_id or '无'})")
 
             try:
-                # 非强制刮削模式下，跳过已有完整数据的条目
+                # 非强制刮削模式下，增量跳过已有完整数据的条目：
+                # - 已有 TMDB ID + 已有别名 + (未开启剧集组 或 已有剧集组) → 跳过
                 existing_group_id = show.get('tmdbEpisodeGroupId')
-                if not force_scrape and tmdb_id and existing_group_id:
-                    self.logger.info(f"跳过 '{title}': 已有TMDB ID({tmdb_id})和剧集组({existing_group_id})，非强制刮削模式。")
-                    skipped_count += 1
-                    processed_count += 1
-                    continue
+                has_alias = show.get('hasAlias', False)
+                if not force_scrape and tmdb_id and has_alias:
+                    # 如果不需要剧集组，或者已有剧集组，则完全跳过
+                    if not enable_episode_group or existing_group_id:
+                        skip_reason = "已有TMDB ID和别名"
+                        if existing_group_id:
+                            skip_reason += f"和剧集组({existing_group_id})"
+                        self.logger.debug(f"增量跳过 '{title}': {skip_reason}")
+                        skipped_count += 1
+                        processed_count += 1
+                        continue
 
                 # 初始化变量
                 use_episode_group = False
@@ -313,6 +350,7 @@ class TmdbAutoMapJob(BaseJob):
                                 continue
                     except Exception as e:
                         self.logger.error(f"搜索 '{title}' 时发生错误: {e}")
+                        await session.rollback()
                         continue
 
                 # 步骤 1.5: 对于已有TMDB ID的作品，也需要识别季度信息

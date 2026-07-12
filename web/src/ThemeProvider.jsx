@@ -1,8 +1,32 @@
 import { createContext, useContext, useEffect, useState, useMemo } from 'react'
 import { ConfigProvider } from 'antd'
 import { theme } from 'antd'
+import { useTranslation } from 'react-i18next'
 
 import zhCN from 'antd/locale/zh_CN'
+import zhTW from 'antd/locale/zh_TW'
+import enUS from 'antd/locale/en_US'
+
+import dayjs from 'dayjs'
+import 'dayjs/locale/zh-cn'
+import 'dayjs/locale/zh-tw'
+import 'dayjs/locale/en'
+
+// 语言 -> AntD locale 映射
+const ANTD_LOCALES = {
+  'zh-CN': zhCN,
+  'zh-TW': zhTW,
+  en: enUS,
+}
+
+// 语言 -> dayjs locale 映射
+const DAYJS_LOCALES = {
+  'zh-CN': 'zh-cn',
+  'zh-TW': 'zh-tw',
+  en: 'en',
+}
+
+const DEFAULT_LANG = 'zh-CN'
 
 // ========== 颜色工具函数 ==========
 
@@ -86,14 +110,45 @@ export const PRESET_THEME_COLORS = [
 
 const DEFAULT_PRIMARY = '#FF6B9B'
 
+// 页面样式（normal: 常规, liquid-glass: 液态玻璃）
+export const PAGE_STYLES = [
+  { key: 'normal', name: '常规' },
+  { key: 'liquid-glass', name: '液态玻璃' },
+]
+const DEFAULT_PAGE_STYLE = 'normal'
+
 // 创建上下文
 const ThemeContext = createContext()
 
 export function ThemeProvider({ children }) {
+  const { i18n } = useTranslation()
   const [isDark, setIsDark] = useState(false)
   const [themeColor, setThemeColorState] = useState(() => {
     return localStorage.getItem('themeColor') || DEFAULT_PRIMARY
   })
+  const [pageStyle, setPageStyleState] = useState(() => {
+    return localStorage.getItem('pageStyle') || DEFAULT_PAGE_STYLE
+  })
+  const [language, setLanguageState] = useState(() => {
+    return localStorage.getItem('lang') || i18n.language || DEFAULT_LANG
+  })
+
+  // 设置语言并持久化（同步切换 i18next 与 dayjs）
+  const setLanguage = (lang) => {
+    setLanguageState(lang)
+    localStorage.setItem('lang', lang)
+    i18n.changeLanguage(lang)
+    dayjs.locale(DAYJS_LOCALES[lang] || 'zh-cn')
+  }
+
+  // 初始化时同步 i18next 与 dayjs 的语言
+  useEffect(() => {
+    if (i18n.language !== language) {
+      i18n.changeLanguage(language)
+    }
+    dayjs.locale(DAYJS_LOCALES[language] || 'zh-cn')
+    document.documentElement.setAttribute('lang', language)
+  }, [language])
 
   // 根据主色生成派生色
   const colors = useMemo(() => generateThemeColors(themeColor), [themeColor])
@@ -128,6 +183,17 @@ export function ThemeProvider({ children }) {
     setThemeColorState(color)
     localStorage.setItem('themeColor', color)
   }
+
+  // 设置页面样式并持久化
+  const setPageStyle = (style) => {
+    setPageStyleState(style)
+    localStorage.setItem('pageStyle', style)
+  }
+
+  // 把 pageStyle 写到 <html> 的 data-page-style 属性，全局 CSS 据此切换
+  useEffect(() => {
+    document.documentElement.setAttribute('data-page-style', pageStyle)
+  }, [pageStyle])
 
   // 初始化：检查系统偏好或本地存储
   useEffect(() => {
@@ -210,6 +276,7 @@ export function ThemeProvider({ children }) {
         colorBorder: colors.light.border,
         borderRadius: 8,
         headerBg: colors.light.hoverBg,
+        rowHoverBg: colors.light.hoverBg,
       },
       List: {
         colorBorder: colors.light.border,
@@ -240,11 +307,19 @@ export function ThemeProvider({ children }) {
       colorBgBase: '#0F172A',
       colorBgContainer: '#1E293B',
       colorBgElevated: '#273449',
+      colorBgLayout: '#0F172A',
+      colorBgSpotlight: '#334155',
       colorTextBase: '#F8FAFC',
       colorTextSecondary: '#E2E8F0',
       colorTextTertiary: '#94A3B8',
+      colorTextQuaternary: '#64748B',
       colorBorder: '#334155',
       colorBorderSecondary: '#2A3A51',
+      // Fill 色系 — 防止 darkAlgorithm 自动派生出不协调的中间色
+      colorFill: 'rgba(255, 255, 255, 0.18)',
+      colorFillSecondary: 'rgba(255, 255, 255, 0.12)',
+      colorFillTertiary: 'rgba(255, 255, 255, 0.08)',
+      colorFillQuaternary: 'rgba(255, 255, 255, 0.04)',
       fontFamily: "'MyNunito', 'Nunito', 'Comic Sans MS', sans-serif",
       controlHeight: 40,
     },
@@ -254,6 +329,7 @@ export function ThemeProvider({ children }) {
         borderRadius: 12,
         boxShadow: `0 4px 16px ${colors.shadow}`,
         colorBorder: '#334155',
+        colorBgContainer: '#1E293B',
       },
       Tabs: {
         colorPrimary: colors.primary,
@@ -276,22 +352,41 @@ export function ThemeProvider({ children }) {
       Form: {
         colorBorder: '#334155',
         itemMarginBottom: 16,
+        labelColor: '#E2E8F0',
       },
       Input: {
         borderRadius: 8,
-        borderColor: '#334155',
-        hoverBorderColor: colors.primary,
         colorBgContainer: '#273449',
+        colorBorder: '#334155',
+        hoverBorderColor: colors.primary,
+        activeBorderColor: colors.primary,
+        addonBg: '#334155',
       },
       InputNumber: { colorBgContainer: '#273449' },
-      Select: { colorBgContainer: '#273449', colorBgElevated: '#334155' },
+      Select: { colorBgContainer: '#273449', colorBgElevated: '#334155', optionSelectedBg: '#334155' },
+      DatePicker: { colorBgContainer: '#273449', colorBgElevated: '#1E293B' },
+      TimePicker: { colorBgContainer: '#273449', colorBgElevated: '#1E293B' },
+      Cascader: { colorBgContainer: '#273449' },
+      TreeSelect: { colorBgContainer: '#273449' },
       Modal: { contentBg: '#1E293B', headerBg: '#1E293B', footerBg: '#1E293B' },
+      Drawer: { colorBgElevated: '#1E293B' },
+      Dropdown: { colorBgElevated: '#1E293B' },
+      Popover: { colorBgElevated: '#1E293B' },
+      Popconfirm: { colorBgElevated: '#1E293B' },
+      Tooltip: { colorBgSpotlight: '#334155' },
+      Message: { contentBg: '#1E293B' },
+      Notification: { colorBgElevated: '#1E293B' },
+      Alert: { colorInfoBg: '#1a2a3a', colorWarningBg: '#2a2517', colorErrorBg: '#2a1515', colorSuccessBg: '#152a1a' },
+      Descriptions: { colorBgContainer: '#1E293B', colorSplit: '#334155' },
+      Tag: { defaultBg: '#273449' },
+      Switch: { colorPrimaryHover: colors.hover },
+      Segmented: { colorBgLayout: '#273449', itemSelectedBg: '#1E293B' },
     },
   }), [colors])
 
   return (
-    <ThemeContext.Provider value={{ isDark, toggleDarkMode, themeColor, setThemeColor }}>
-      <ConfigProvider locale={zhCN} theme={isDark ? darkTheme : lightTheme}>
+    <ThemeContext.Provider value={{ isDark, toggleDarkMode, themeColor, setThemeColor, pageStyle, setPageStyle, language, setLanguage }}>
+      <ConfigProvider locale={ANTD_LOCALES[language] || zhCN} theme={isDark ? darkTheme : lightTheme}>
         {children}
       </ConfigProvider>
     </ThemeContext.Provider>

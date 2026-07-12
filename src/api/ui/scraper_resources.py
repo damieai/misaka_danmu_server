@@ -343,11 +343,25 @@ async def get_repo_refs(
                         branches = [b["name"] for b in resp.json()]
                 except Exception as e:
                     logger.warning(f"获取 GitHub 分支列表失败: {e}")
-                # 获取最近5个 tag
+                # 获取最近5个 tag，并为每个 tag 获取其 min_server_version
                 try:
                     resp = await client.get(f"https://api.github.com/repos/{owner}/{repo}/tags?per_page=5")
                     if resp.status_code == 200:
-                        tags = [t["name"] for t in resp.json()]
+                        tag_names = [t["name"] for t in resp.json()]
+                        # 并发获取每个 tag 的 package.json 中的 min_server_version
+                        async def _get_tag_min_ver(tag_name):
+                            try:
+                                pkg_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{tag_name}/package.json"
+                                pkg_resp = await client.get(pkg_url)
+                                if pkg_resp.status_code == 200:
+                                    return pkg_resp.json().get("min_server_version")
+                            except Exception:
+                                pass
+                            return None
+
+                        import asyncio as _aio
+                        min_vers = await _aio.gather(*[_get_tag_min_ver(t) for t in tag_names])
+                        tags = [{"name": t, "minServerVersion": v} for t, v in zip(tag_names, min_vers)]
                 except Exception as e:
                     logger.warning(f"获取 GitHub 标签列表失败: {e}")
             elif gitee_info:
@@ -361,7 +375,21 @@ async def get_repo_refs(
                 try:
                     resp = await client.get(f"https://gitee.com/api/v5/repos/{owner}/{repo}/tags?per_page=5")
                     if resp.status_code == 200:
-                        tags = [t["name"] for t in resp.json()]
+                        tag_names = [t["name"] for t in resp.json()]
+                        # 并发获取每个 tag 的 package.json 中的 min_server_version
+                        async def _get_gitee_tag_min_ver(tag_name):
+                            try:
+                                pkg_url = f"https://gitee.com/{owner}/{repo}/raw/{tag_name}/package.json"
+                                pkg_resp = await client.get(pkg_url)
+                                if pkg_resp.status_code == 200:
+                                    return pkg_resp.json().get("min_server_version")
+                            except Exception:
+                                pass
+                            return None
+
+                        import asyncio as _aio
+                        min_vers = await _aio.gather(*[_get_gitee_tag_min_ver(t) for t in tag_names])
+                        tags = [{"name": t, "minServerVersion": v} for t, v in zip(tag_names, min_vers)]
                 except Exception as e:
                     logger.warning(f"获取 Gitee 标签列表失败: {e}")
     except Exception as e:
@@ -563,10 +591,21 @@ async def save_resource_repo(
 @router.post("/scrapers/backup", summary="备份当前弹幕源")
 async def backup_scrapers(
     current_user: models.User = Depends(get_current_user),
+    new_versions_data: Optional[Dict[str, str]] = None,
+    new_hashes_data: Optional[Dict[str, str]] = None,
+    package_data: Optional[Dict[str, Any]] = None,
 ):
     """备份当前 scrapers 目录下的编译文件到持久化目录
 
-    直接从 scrapers 目录复制所有 .so/.pyd 文件和 versions.json 到备份目录
+    直接从 scrapers 目录复制所有 .so/.pyd 文件和 versions.json 到备份目录。
+
+    自动更新（非首次下载）场景说明：
+    逐文件自动更新只把新 .so 下到 scrapers 目录，并不会更新 scrapers/versions.json。
+    若此时仍直接复制旧的 scrapers/versions.json 到备份目录，备份目录的 updated_at
+    不会比 scrapers 目录新，重启后 scraper_manager 便不会从备份恢复新版本，从而导致
+    “下载新版→重启→版本回退→再下载”的无限重启循环。
+    因此这里允许调用方传入 new_versions_data / new_hashes_data / package_data，
+    直接用新版本信息构建备份目录的 versions.json（含 updated_at），确保新版本被正确持久化。
     """
     try:
         scrapers_dir = _get_scrapers_dir()
@@ -618,18 +657,76 @@ async def backup_scrapers(
                 backup_count += 1
 
         # 备份 package.json
-        if SCRAPERS_PACKAGE_FILE.exists():
+        # 若调用方传入了 package_data（自动更新场景），优先用它构建备份目录的 package.json，
+        # 确保备份目录的整体版本号（前端读取用）与新版本一致。
+        if package_data is not None:
+            try:
+                (BACKUP_DIR / "package.json").write_text(
+                    json.dumps(package_data, indent=2, ensure_ascii=False)
+                )
+                logger.info("已用新版本数据写入备份目录 package.json")
+            except Exception as e:
+                logger.warning(f"写入备份 package.json 失败: {e}")
+        elif SCRAPERS_PACKAGE_FILE.exists():
             shutil.copy2(SCRAPERS_PACKAGE_FILE, BACKUP_DIR / "package.json")
             logger.info("已备份 package.json")
 
-        # 备份 versions.json（直接复制，因为版本信息已经保存到 scrapers 目录了）
-        if SCRAPERS_VERSIONS_FILE.exists():
+        # 备份 versions.json
+        # why：自动更新逐文件模式不会更新 scrapers/versions.json，若直接复制旧文件，
+        # 备份目录 updated_at 不会变新，重启后不会从备份恢复新版本 → 无限重启循环。
+        # 因此当调用方传入新版本数据时，直接用新版本构建备份目录的 versions.json（含新 updated_at）。
+        if new_versions_data is not None:
+            try:
+                backup_versions_file = BACKUP_DIR / "versions.json"
+                merged_scrapers: Dict[str, Any] = {}
+                merged_hashes: Dict[str, Any] = {}
+                min_server_version = None
+                # 以备份目录现有 versions.json 为基础做合并（保留未变动源的版本/哈希）
+                if backup_versions_file.exists():
+                    try:
+                        existing = json.loads(backup_versions_file.read_text())
+                        merged_scrapers = dict(existing.get("scrapers", {}))
+                        merged_hashes = dict(existing.get("hashes", {}))
+                        min_server_version = existing.get("min_server_version")
+                    except Exception:
+                        pass
+                merged_scrapers.update(new_versions_data)
+                if new_hashes_data:
+                    merged_hashes.update(new_hashes_data)
+                # package_data 可能携带更高的最低服务器版本要求，以它为准
+                if package_data and package_data.get("min_server_version"):
+                    min_server_version = package_data.get("min_server_version")
+
+                platform_key_str = get_platform_key()
+                built_versions = {
+                    "platform": platform_key_str.split("_")[0] if "_" in platform_key_str else platform_key_str,
+                    "type": platform_key_str.split("_")[1] if "_" in platform_key_str else "",
+                    "scrapers": merged_scrapers,
+                    "hashes": merged_hashes,
+                    "updated_at": datetime.now().isoformat(),
+                }
+                if min_server_version:
+                    built_versions["min_server_version"] = min_server_version
+                backup_versions_file.write_text(
+                    json.dumps(built_versions, indent=2, ensure_ascii=False)
+                )
+                # 用新构建的数据覆盖本地 versions 变量，供后续备份元数据版本号提取使用
+                versions = built_versions
+                logger.info(
+                    f"已用新版本数据写入备份目录 versions.json："
+                    f"{len(merged_scrapers)} 个源版本, {len(merged_hashes)} 个哈希值"
+                )
+            except Exception as e:
+                logger.warning(f"用新版本数据写入备份 versions.json 失败: {e}")
+        elif SCRAPERS_VERSIONS_FILE.exists():
             shutil.copy2(SCRAPERS_VERSIONS_FILE, BACKUP_DIR / "versions.json")
             logger.info("已备份 versions.json")
 
         # 读取 package.json 的版本号（用于元数据）
         package_version = None
-        if SCRAPERS_PACKAGE_FILE.exists():
+        if package_data is not None:
+            package_version = package_data.get("version")
+        elif SCRAPERS_PACKAGE_FILE.exists():
             try:
                 local_package_data = json.loads(SCRAPERS_PACKAGE_FILE.read_text())
                 package_version = local_package_data.get("version")
@@ -1482,10 +1579,10 @@ async def load_resources_stream(
                     # 判断是否是首次下载（本地没有任何弹幕源）
                     is_first_download = len(manager.scrapers) == 0
 
-                    from src.utils.docker_utils import is_docker_socket_available, restart_container
+                    from src.utils.docker_utils import is_docker_socket_available, is_running_in_docker, restart_container
                     import sys
 
-                    docker_available = is_docker_socket_available()
+                    docker_available = is_docker_socket_available() and is_running_in_docker()
 
                     # ========== 先备份新下载的资源到持久化目录（在 SSE 流中同步执行）==========
                     if download_count > 0:
@@ -2168,6 +2265,39 @@ async def _download_and_extract_release(
         if progress_callback:
             await progress_callback("正在解压文件...")
 
+        # ── 解压前版本检查：从包内读取 versions.json 的 min_server_version ──
+        try:
+            min_server_version = None
+            if filename.endswith('.tar.gz') or filename.endswith('.tgz'):
+                with tarfile.open(fileobj=io.BytesIO(archive_content), mode='r:gz') as pre_tar:
+                    for m in pre_tar.getmembers():
+                        if m.isfile() and Path(m.name).name == 'versions.json':
+                            fo = pre_tar.extractfile(m)
+                            if fo:
+                                min_server_version = json.loads(fo.read()).get('min_server_version')
+                            break
+            else:
+                with zipfile.ZipFile(io.BytesIO(archive_content), 'r') as pre_zip:
+                    for zi in pre_zip.infolist():
+                        if Path(zi.filename).name == 'versions.json':
+                            min_server_version = json.loads(pre_zip.read(zi.filename)).get('min_server_version')
+                            break
+
+            if min_server_version:
+                from src._version import APP_VERSION
+                from src.services.scraper_manager import _version_satisfies
+                if not _version_satisfies(APP_VERSION, min_server_version):
+                    logger.error(
+                        f"全量替换中止：弹幕源包要求服务器版本 >= {min_server_version}，"
+                        f"当前版本 {APP_VERSION}"
+                    )
+                    if progress_callback:
+                        await progress_callback(f"版本不满足：需要 >= {min_server_version}，当前 {APP_VERSION}")
+                    return False
+                logger.info(f"版本检查通过: 服务器 {APP_VERSION} >= 弹幕源包要求 {min_server_version}")
+        except Exception as e:
+            logger.warning(f"解压前版本检查失败（宽松放行）: {e}")
+
         # 记录旧文件列表（解压完成后清理多余的旧文件）
         old_files = {
             file.name for file in scrapers_dir.glob("*")
@@ -2204,15 +2334,18 @@ async def _download_and_extract_release(
                             logger.warning(f"检测到路径穿越尝试: {member.name}")
                             continue
 
-                        # 读取并写入文件
+                        # 读取并写入文件（同步写入，避免 asyncio.to_thread 在 ARM64+uvloop 下触发 native crash）
                         file_obj = tar_ref.extractfile(member)
                         if file_obj:
                             file_content = file_obj.read()
-                            await asyncio.to_thread(target_path.write_bytes, file_content)
+                            if len(file_content) == 0 and base_name.endswith(('.so', '.pyd')):
+                                logger.warning(f"跳过 0 字节文件: {base_name}")
+                                continue
+                            target_path.write_bytes(file_content)
                             extracted_count += 1
                             if base_name.endswith(('.so', '.pyd')):
                                 new_files.add(base_name)
-                            logger.debug(f"解压: {base_name}")
+                            logger.debug(f"解压: {base_name} ({len(file_content)} 字节)")
         else:
             # 处理 zip 格式
             with zipfile.ZipFile(io.BytesIO(archive_content), 'r') as zip_ref:
@@ -2234,13 +2367,16 @@ async def _download_and_extract_release(
                             logger.warning(f"检测到路径穿越尝试: {zip_info.filename}")
                             continue
 
-                        # 读取并写入文件
+                        # 读取并写入文件（同步写入，避免 asyncio.to_thread 在 ARM64+uvloop 下触发 native crash）
                         file_content = zip_ref.read(zip_info.filename)
-                        await asyncio.to_thread(target_path.write_bytes, file_content)
+                        if len(file_content) == 0 and base_name.endswith(('.so', '.pyd')):
+                            logger.warning(f"跳过 0 字节文件: {base_name}")
+                            continue
+                        target_path.write_bytes(file_content)
                         extracted_count += 1
                         if base_name.endswith(('.so', '.pyd')):
                             new_files.add(base_name)
-                        logger.debug(f"解压: {base_name}")
+                        logger.debug(f"解压: {base_name} ({len(file_content)} 字节)")
 
         logger.info(f"解压完成: 共 {extracted_count} 个文件")
 

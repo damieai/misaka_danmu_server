@@ -10,6 +10,7 @@ from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 7768
+    ipv6: bool = True  # 是否同时启用 IPv6 监听（dual-stack）
 
 # 新增：前端客户端配置模型
 class ClientConfig(BaseModel):
@@ -60,8 +61,9 @@ def _generate_config_template(jwt_secret: str) -> str:
 
 # 服务器监听配置
 server:
-  host: "0.0.0.0"      # 监听地址，0.0.0.0 表示所有网卡
+  host: "0.0.0.0"      # IPv4 监听地址，0.0.0.0 表示所有网卡
   port: 7768            # 监听端口
+  ipv6: true            # 是否同时监听 IPv6（双栈）
 
 # 数据库配置（支持 mysql / postgresql / sqlite）
 database:
@@ -141,28 +143,13 @@ class YamlConfigSettingsSource(PydanticBaseSettingsSource):
             # 容器环境
             self.yaml_file = Path("/app/config/config.yml")
         else:
-            # 源码运行环境
-            self.yaml_file = Path("config/config.yml")
+            # 源码运行环境：基于本文件位置推算项目根目录
+            # config.py 位于 src/core/config.py → 项目根 = ../../
+            project_root = Path(__file__).resolve().parent.parent.parent
+            self.yaml_file = project_root / "config" / "config.yml"
 
-        # 自动创建：若配置文件不存在则生成带注释的模板
-        if not self.yaml_file.exists():
-            try:
-                self.yaml_file.parent.mkdir(parents=True, exist_ok=True)
-                jwt_secret = secrets.token_urlsafe(32)
-                template = _generate_config_template(jwt_secret)
-                self.yaml_file.write_text(template, encoding="utf-8")
-                import sys
-                print(
-                    f"\n{'='*60}\n"
-                    f"[Misaka] 未检测到配置文件，已自动生成模板：\n"
-                    f"  {self.yaml_file.resolve()}\n"
-                    f"请根据实际环境修改配置后重启服务。\n"
-                    f"{'='*60}\n",
-                    file=sys.stderr,
-                )
-            except OSError as e:
-                import sys
-                print(f"[Misaka] 警告：无法创建配置文件 {self.yaml_file}: {e}", file=sys.stderr)
+        # 不再自动创建配置文件，由 bootstrap.preload_config() 负责
+        # 这样辅助脚本（如 reset_password.py）导入 settings 时不会意外生成新配置文件
 
     def get_field_value(self, field, field_name):
         return None, None, False

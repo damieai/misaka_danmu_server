@@ -6,6 +6,7 @@ import { Header } from './Header.jsx'
 import { useAtomValue, useSetAtom } from 'jotai'
 import { isMobileAtom, userinfoAtom } from '../../store/index.js'
 import { getUserInfo, autoLogin } from '../apis/index.js'
+import { useAnchorScroll } from '../hooks/useAnchorScroll.js'
 import classNames from 'classnames'
 import Cookies from 'js-cookie'
 
@@ -13,6 +14,9 @@ export const Layout = () => {
   const setUserinfo = useSetAtom(userinfoAtom)
   const isMobile = useAtomValue(isMobileAtom)
   const [isAuthenticating, setIsAuthenticating] = useState(true)
+
+  // 全功能搜索：监听 location.hash，跳转后滚动到目标功能区块并高亮
+  useAnchorScroll()
 
   useEffect(() => {
     const token = Cookies.get('danmu_token')
@@ -23,7 +27,8 @@ export const Layout = () => {
         .then(res => {
           // 自动登录成功，保存 token
           const { accessToken, expiresIn } = res.data
-          const expiresInDays = expiresIn / (60 * 24)
+          const expiresInMinutes = (!expiresIn || expiresIn <= 0) ? (365 * 24 * 60) : expiresIn
+          const expiresInDays = expiresInMinutes / (60 * 24)
           Cookies.set('danmu_token', accessToken, {
             expires: expiresInDays,
             path: '/',
@@ -41,9 +46,10 @@ export const Layout = () => {
             window.location.href = '/login'
           }
         })
-        .catch(err => {
+        .catch(() => {
           // 自动登录失败（不在白名单中），跳转登录页
-          console.log('自动登录失败，跳转登录页')
+          Cookies.remove('danmu_token', { path: '/' })
+          setUserinfo(undefined)
           window.location.href = '/login'
         })
     } else {
@@ -59,9 +65,11 @@ export const Layout = () => {
           }
         })
         .catch(err => {
-          // API 返回 401 或其他错误，跳转登录页
-          // fetch.js 的拦截器会自动处理 401 并跳转
+          // API 返回 401 或其他错误，清理本地 token 并跳转登录页，避免卡在“正在加载...”
           console.error('获取用户信息失败:', err)
+          Cookies.remove('danmu_token', { path: '/' })
+          setUserinfo(undefined)
+          window.location.href = '/login'
         })
     }
   }, [])
@@ -80,7 +88,7 @@ export const Layout = () => {
           <Header />
           <div
             className={classNames({
-              'w-full min-h-screen px-4 pb-22 pt-14': isMobile,
+              'w-full min-h-screen px-4 pb-28 pt-14': isMobile,
               'max-w-[1200px] min-h-screen mx-auto pt-18 pb-10 px-8': !isMobile,
             })}
           >

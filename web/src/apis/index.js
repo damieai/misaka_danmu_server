@@ -1,5 +1,16 @@
 import api from './fetch'
 
+const toUrlEncodedForm = data => {
+  const form = new URLSearchParams()
+  Object.entries(data || {}).forEach(([key, value]) => {
+    if (value !== undefined && value !== null) {
+      form.append(key, value)
+    }
+  })
+  return form
+}
+
+
 /** 获取应用版本号 */
 export const getVersion = () => api.get('/api/ui/version')
 
@@ -23,7 +34,7 @@ export const restartService = () => api.post('/api/ui/restart')
 /** -------------------------------------------------用户相关开始------------------------------------------------- */
 /** 登录 */
 export const login = data =>
-  api.post('/api/ui/auth/token', data, {
+  api.post('/api/ui/auth/token', toUrlEncodedForm(data), {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
   })
 
@@ -59,6 +70,46 @@ export const revokeSession = sessionId =>
 /** 踢出所有其他会话 */
 export const revokeOtherSessions = () =>
   api.delete('/api/ui/auth/sessions/others/all')
+
+/** ---------------------------------------------------MFA 相关------------------------------------------------ */
+/** 获取 MFA 状态 */
+export const getMfaStatus = () => api.get('/api/ui/auth/mfa/status')
+/** 生成 TOTP 密钥 */
+export const setupTotp = () => api.post('/api/ui/auth/mfa/totp/setup')
+/** 确认 TOTP 设置 */
+export const verifyTotpSetup = data =>
+  api.post('/api/ui/auth/mfa/totp/verify-setup', data)
+/** 关闭 TOTP */
+export const disableTotp = data =>
+  api.post('/api/ui/auth/mfa/totp/disable', data)
+/** 统一 MFA 验证（签发 JWT） */
+export const mfaVerify = data =>
+  api.post('/api/ui/auth/mfa/verify', toUrlEncodedForm(data), {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  })
+/** 生成 PassKey 注册选项 */
+export const getPasskeyRegisterOptions = () =>
+  api.post('/api/ui/auth/mfa/passkey/register/options')
+/** 验证 PassKey 注册 */
+export const verifyPasskeyRegister = data =>
+  api.post('/api/ui/auth/mfa/passkey/register/verify', data)
+/** 生成 PassKey 认证选项（MFA 流程） */
+export const getPasskeyAuthOptions = (username = '') =>
+  api.post(`/api/ui/auth/mfa/passkey/authenticate/options?username=${encodeURIComponent(username)}`)
+/** 重命名 PassKey */
+export const renamePasskey = (passkeyId, data) =>
+  api.put(`/api/ui/auth/mfa/passkey/${passkeyId}/rename`, data)
+/** 删除 PassKey */
+export const deletePasskey = passkeyId =>
+  api.delete(`/api/ui/auth/mfa/passkey/${passkeyId}`)
+/** PassKey 无密码登录 - 获取选项 */
+export const getPasskeyLoginOptions = () =>
+  api.post('/api/ui/auth/mfa/passkey/login/options')
+/** PassKey 无密码登录 - 验证 */
+export const verifyPasskeyLogin = data =>
+  api.post('/api/ui/auth/mfa/passkey/login/verify', toUrlEncodedForm(data), {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  })
 
 /** ---------------------------------------------------首页接口------------------------------------------------ */
 /** 获取日志 */
@@ -98,8 +149,18 @@ export const getBangumiDetailTest = data =>
   api.get(`/api/v1/${data.apiToken}/bangumi/${data.bangumiId}`)
 
 /** 弹幕获取测试 */
-export const getCommentTest = data =>
-  api.get(`/api/v1/${data.apiToken}/comment/${data.episodeId}`)
+export const getCommentTest = data => {
+  const params = new URLSearchParams()
+  if (data.asyncMode) params.append('async', '1')
+  if (data.chConvert != null && data.chConvert !== 0) params.append('chConvert', data.chConvert)
+  if (data.withRelated === false) params.append('withRelated', 'false')
+  const query = params.toString()
+  return api.get(`/api/v1/${data.apiToken}/comment/${data.episodeId}${query ? `?${query}` : ''}`)
+}
+
+/** 弹幕异步任务轮询测试 */
+export const pollTaskCommentTest = data =>
+  api.get(`/api/v1/${data.apiToken}/taskcomment/${data.taskId}`)
 
 /** 文件名识别测试 */
 export const parseFilenameTest = data =>
@@ -305,6 +366,18 @@ export const getDanmakuChConvertPriority = () =>
 /** 弹幕输出配置 简繁转换优先级 */
 export const setDanmakuChConvertPriority = data =>
   api.put('/api/ui/config/danmakuChConvertPriority', data)
+/** 弹幕输出配置 顶部弹幕转换目标（none/bottom/scroll） */
+export const getDanmakuTopConvertTo = () =>
+  api.get('/api/ui/config/danmakuTopConvertTo')
+/** 弹幕输出配置 顶部弹幕转换目标 */
+export const setDanmakuTopConvertTo = data =>
+  api.put('/api/ui/config/danmakuTopConvertTo', data)
+/** 弹幕输出配置 底部弹幕转换目标（none/top/scroll） */
+export const getDanmakuBottomConvertTo = () =>
+  api.get('/api/ui/config/danmakuBottomConvertTo')
+/** 弹幕输出配置 底部弹幕转换目标 */
+export const setDanmakuBottomConvertTo = data =>
+  api.put('/api/ui/config/danmakuBottomConvertTo', data)
 /** 弹幕输出配置 输出点赞状态开关 */
 export const getDanmakuLikesOutputEnabled = () =>
   api.get('/api/ui/config/danmakuLikesOutputEnabled')
@@ -420,6 +493,15 @@ export const getBangumiConfig = () => api.get('/api/ui/config/provider/bangumi')
 /** 设置bangumi api配置 */
 export const setBangumiConfig = data =>
   api.put('/api/ui/config/provider/bangumi', data)
+/** 查询 bangumi-data 离线索引状态（库内条数） */
+export const getBangumiDataStatus = () =>
+  api.get('/api/ui/bangumi-data/status')
+/** 手动触发 bangumi-data 离线索引同步 */
+export const syncBangumiData = () =>
+  api.post('/api/ui/bangumi-data/sync')
+/** 清除 bangumi-data 离线索引数据 */
+export const clearBangumiData = () =>
+  api.post('/api/ui/bangumi-data/clear')
 /** 获取授权信息 */
 export const getBangumiAuth = () =>
   api.post('/api/ui/metadata/bangumi/actions/get_auth_state')
@@ -429,6 +511,17 @@ export const getBangumiAuthUrl = (data) =>
 /** 注销授权 */
 export const logoutBangumiAuth = () =>
   api.post('/api/ui/metadata/bangumi/actions/logout')
+/** 刷新/续期授权 (使用 refresh_token，不跳转) */
+export const refreshBangumiAuth = () =>
+  api.post('/api/ui/metadata/bangumi/actions/refresh_token')
+
+/** Trakt OAuth Auth */
+export const getTraktAuthStatus = () =>
+  api.post('/api/ui/metadata/trakt/actions/get_auth_status')
+export const saveTraktOAuth = (data) =>
+  api.post('/api/ui/metadata/trakt/actions/save_oauth', data)
+export const logoutTraktAuth = () =>
+  api.post('/api/ui/metadata/trakt/actions/revoke_auth')
 
 /** ------------------------------------------ 豆瓣、tmdb、tvdb配置、代理------------------------------------------  */
 /** 获取tmdb配置 */
@@ -454,6 +547,9 @@ export const setProxyConfig = data => api.put('/api/ui/config/proxy', data)
 
 /** 测试代理连接 */
 export const testProxy = data => api.post('/api/ui/proxy/test', data)
+
+/** 单独测试某个域名的速度 / DNS 解析 */
+export const testSingleTarget = data => api.post('/api/ui/proxy/test-single', data)
 
 /** 获取受信任的反向代理IP */
 export const getTrustedProxiesConfig = () =>
@@ -543,6 +639,25 @@ export const setGlobalFilter = data =>
   api.put('/api/ui/settings/global-filter', data)
 /** 获取全局过滤默认规则 */
 export const getGlobalFilterDefaults = () => api.get('/api/ui/settings/global-filter/defaults')
+
+/** 获取单剧分集过滤规则 */
+export const getSingleEpisodeFilter = () => api.get('/api/ui/settings/single-episode-filter')
+/** 更新单剧分集过滤规则 */
+export const setSingleEpisodeFilter = data =>
+  api.put('/api/ui/settings/single-episode-filter', data)
+/** 获取兜底全局分集标题过滤配置 */
+export const getGlobalEpisodeTitleFilter = () => api.get('/api/ui/settings/global-episode-title-filter')
+/** 更新兜底全局分集标题过滤配置 */
+export const setGlobalEpisodeTitleFilter = data =>
+  api.put('/api/ui/settings/global-episode-title-filter', data)
+/** 获取兜底分集标题过滤默认正则 */
+export const getGlobalEpisodeTitleFilterDefaults = () => api.get('/api/ui/settings/global-episode-title-filter/defaults')
+
+/** 使用后端 Python regex 测试正则 */
+export const testRegexPatterns = data => api.post('/api/ui/settings/regex-test', data)
+
+/** 获取弹幕黑名单默认规则 */
+export const getDanmakuBlacklistDefaults = () => api.get('/api/ui/settings/danmaku-blacklist/defaults')
 /** 获取搜索源默认分集黑名单 */
 export const getScraperDefaultBlacklist = (providerName) =>
   api.get(`/api/ui/scrapers/${providerName}/default-blacklist`)
@@ -590,6 +705,14 @@ export const addSourceToAnime = data =>
 /** 批量手动导入 */
 export const batchManualImport = data =>
   api.post(`/api/ui/library/source/${data.sourceId}/batch-import`, data)
+
+/** 导入整个合集为当前源的分集（目前仅 B站 ugc_season） */
+export const importCollection = data =>
+  api.post(`/api/ui/library/source/${data.sourceId}/import-collection`, {
+    url: data.url,
+    title: data.title,
+    startEpisodeIndex: data.startEpisodeIndex,
+  })
 
 /** 校验并解析导入URL */
 export const validateImportUrl = data =>
@@ -1026,6 +1149,71 @@ export const batchMergeAnimes = (data) =>
   api.post('/api/ui/library/batch-merge', data)
 
 
+// ========== 日历视图 ==========
+
+/** 获取每周番表数据 */
+export const getWeeklyCalendar = () => api.get('/api/ui/calendar/weekly')
+
+/** 同步播出日程（Bangumi + Trakt） */
+export const syncSchedule = () => api.post('/api/ui/calendar/sync-bangumi-schedule')
+
+/** 清除日历同步缓存 */
+export const clearCalendarCache = () => api.post('/api/ui/calendar/clear-cache')
+
+/** 当季新番发现 */
+export const discoverCurrentSeason = () => api.get('/api/ui/calendar/discover')
+
+/** 订阅外部番（标记订阅意向，可选立即执行轮询） */
+export const subscribeCalendarItem = (data) => api.post('/api/ui/calendar/subscribe', data)
+
+/** 批量订阅外部番 */
+export const batchSubscribeCalendarItems = (data) => api.post('/api/ui/calendar/subscribe/batch', data)
+
+/** 取消订阅外部番 */
+export const unsubscribeCalendarItem = (data) => api.post('/api/ui/calendar/unsubscribe', data)
+
+
+// ========== 通用订阅助手 ==========
+
+/** 探测当前可用订阅源（弹幕源 + 元数据源） */
+export const getAvailableSubscriptionSources = () => api.get('/api/ui/subscriptions/available-sources')
+
+/** 发现可订阅目标（关键词搜索 / URL 解析合集） */
+// 注意：此项目的 api.get 第二个参数直接是 query params（已封装），不要再包 { params }
+export const discoverSubscriptionTargets = (params) => api.get('/api/ui/subscriptions/discover', params)
+
+// 按 URL 自动定位订阅源并发现候选（后端按各源 handled_domains 匹配，前端无需硬编码域名）
+export const resolveSubscriptionUrl = (url) => api.post('/api/ui/subscriptions/resolve-url', { url })
+
+/** 离线探索（bangumi-data 为主 + 在线为辅）：秒搜 + 多语言别名 + 平台映射 */
+// onlineProvider 可选，传入则并行用在线源补充（如 bangumi / trakt）
+export const discoverOfflineSubscriptionTargets = (params) => api.get('/api/ui/subscriptions/discover/offline', params)
+
+/** 查询订阅目标 */
+export const getSubscriptionTargets = (params) => api.get('/api/ui/subscriptions/targets', params)
+
+/** 创建订阅目标（provider/type/payload 通用结构） */
+export const createSubscriptionTarget = (data) => api.post('/api/ui/subscriptions/targets', data)
+
+/** 修改订阅目标（启用状态/状态/extraData 补丁） */
+export const updateSubscriptionTarget = (id, data) => api.patch(`/api/ui/subscriptions/targets/${id}`, data)
+
+/** 取消订阅目标 */
+export const deleteSubscriptionTarget = (id) => api.delete(`/api/ui/subscriptions/targets/${id}`)
+
+/** 立即扫描订阅目标 */
+export const scanSubscriptionTarget = (id) => api.post(`/api/ui/subscriptions/targets/${id}/scan`)
+
+/** 查询订阅候选项 */
+export const getSubscriptionItems = (params) => api.get('/api/ui/subscriptions/items', params)
+
+/** 重试订阅候选项 */
+export const retrySubscriptionItem = (id) => api.post(`/api/ui/subscriptions/items/${id}/retry`)
+
+/** 忽略订阅候选项 */
+export const ignoreSubscriptionItem = (id) => api.post(`/api/ui/subscriptions/items/${id}/ignore`)
+
+
 // ========== 通知渠道 ==========
 
 /** 获取可用渠道类型 */
@@ -1079,3 +1267,83 @@ export const reorderAnimeGroups = (data) => api.patch('/api/ui/anime/groups/reor
 
 /** 设置或清除条目所属分组（groupId=null 则移出分组） */
 export const setAnimeGroupMembership = (animeId, data) => api.patch(`/api/ui/anime/${animeId}/group`, data)
+
+
+/** ---------------------------------------------------缓存管理相关开始------------------------------------------------ */
+/** 获取缓存统计信息 */
+export const getCacheStats = () => api.get('/api/ui/cache/stats')
+
+/** 获取缓存条目列表 */
+export const getCacheList = (params) => api.get('/api/ui/cache/list', { params })
+
+/** 清除缓存 */
+export const clearCache = (region) => api.delete('/api/ui/cache/clear', { params: { region } })
+
+/** 删除单条缓存 */
+export const deleteCacheKey = (key, region) => api.delete('/api/ui/cache/key', { params: { key, region } })
+/** ---------------------------------------------------缓存管理相关结束------------------------------------------------ */
+
+/** 获取单条缓存完整值 */
+export const getCacheDetail = (key, region) => api.get('/api/ui/cache/detail', { params: { key, region } })
+
+/** 获取备份详情 */
+export const getBackupDetail = (filename) => api.get(`/api/ui/backup/detail/${filename}`)
+
+/** 备份预检 */
+export const backupDryRun = (data) => api.post('/api/ui/backup/dry-run', data)
+
+/** 匹配调试 */
+export const matchTrace = (data) => api.post('/api/ui/debug/match-trace', data)
+
+// ==================== 系统健康度 ====================
+export const getScraperHealthStats = () => api.get('/api/ui/system-health/scraper-stats')
+export const resetScraperHealthStats = () => api.post('/api/ui/system-health/scraper-stats/reset')
+export const getSystemHealthSummary = () => api.get('/api/ui/system-health/summary')
+export const getConfigScore = () => api.get('/api/ui/system-health/config-score')
+export const getAnimePriority = () => api.get('/api/ui/system-health/anime-priority')
+export const setAnimePriority = (data) => api.post('/api/ui/system-health/anime-priority', data)
+export const batchSetAnimePriority = (data) => api.post('/api/ui/system-health/anime-priority/batch', data)
+
+// ==================== 诊断中心 ====================
+export const getEnvironmentInfo = () => api.get('/api/ui/diagnostics/environment')
+export const analyzeLogDiagnostics = (hours = 24) => api.get(`/api/ui/diagnostics/log-analysis?hours=${hours}`)
+export const getFullDiagnostics = () => api.get('/api/ui/diagnostics/full')
+
+// ==================== 数据体检 ====================
+export const scanDataIssues = (limit = 50) => api.get(`/api/ui/data-check/scan?limit=${limit}`)
+export const fixOrphanEpisodes = () => api.post('/api/ui/data-check/fix-orphans')
+export const clearBrokenMappings = () => api.post('/api/ui/data-check/clear-mapping')
+
+// ==================== 识别词检测 ====================
+export const checkRecognitionConflicts = () => api.get('/api/ui/recognition-check/conflicts')
+export const testRecognitionRule = (data) => api.post('/api/ui/recognition-check/test', data)
+
+// ==================== 配置变更历史 ====================
+export const getConfigHistory = (params) => api.get('/api/ui/config-history/list', { params })
+export const rollbackConfig = (data) => api.post('/api/ui/config-history/rollback', data)
+export const clearConfigHistory = () => api.post('/api/ui/config-history/clear')
+
+// ==================== 任务画像 / 容量趋势 ====================
+export const getTaskProfiles = (days = 7) => api.get(`/api/ui/task-profile/summary?days=${days}`)
+export const getTaskTimeline = (taskId) => api.get('/api/ui/task-profile/timeline', { params: { task_id: taskId } })
+export const getCapacityTrends = () => api.get('/api/ui/trends/capacity')
+export const getCurrentCapacity = () => api.get('/api/ui/trends/current')
+
+// ==================== 安全审计 ====================
+export const getAuditLogs = (params) => api.get('/api/ui/audit/logs', { params })
+export const getSessionStats = () => api.get('/api/ui/audit/session-stats')
+export const clearAuditLogs = () => api.post('/api/ui/audit/clear')
+
+// ==================== 日程增强 ====================
+export const getUpcomingShows = (days = 7) => api.get(`/api/ui/calendar/upcoming?days=${days}`)
+export const getStaleEpisodes = () => api.get('/api/ui/calendar/stale-episodes')
+
+// ==================== AI 可解释性 ====================
+export const getRecentAIMatches = (limit = 20) => api.get(`/api/ui/ai-explain/recent-matches?limit=${limit}`)
+export const getAIMatchExplainStats = (hours = 24) => api.get(`/api/ui/ai-explain/stats?hours=${hours}`)
+export const getLowConfidenceMatches = () => api.get('/api/ui/ai-explain/low-confidence')
+
+// ==================== 本地扫描增量 ====================
+export const getScanIndexStats = () => api.get('/api/ui/local-scan/index-stats')
+export const rebuildScanIndex = () => api.post('/api/ui/local-scan/rebuild-index')
+export const getScanIndexDetail = (params) => api.get('/api/ui/local-scan/index-detail', { params })

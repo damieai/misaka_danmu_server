@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useTranslation } from 'react-i18next'
 import { Modal, Spin, Tag, Badge, Typography, Collapse, Timeline, Button } from 'antd'
 import { getReleaseHistory } from '../apis'
 import { useMessage } from '../MessageContext'
@@ -8,13 +9,11 @@ import ReactMarkdown from 'react-markdown'
 const { Text } = Typography
 
 /**
- * 预处理 GitHub Release 的 changelog 文本，使 ReactMarkdown 能正确渲染换行。
+ * 预处理 GitHub Release 的 changelog 文本，使 ReactMarkdown 能正确渲染。
  */
 const preprocessChangelog = (text) => {
   if (!text) return text
-  return text
-    .replace(/\r\n/g, '\n')       // 统一换行符
-    .replace(/\n(?!\n)/g, '\n\n') // 单换行 → 双换行（保留已有的双换行）
+  return text.replace(/\r\n/g, '\n')
 }
 
 // Markdown 渲染样式
@@ -59,6 +58,7 @@ const markdownComponents = {
 }
 
 export const ReleaseHistoryModal = ({ open, onClose }) => {
+  const { t } = useTranslation()
   const [loading, setLoading] = useState(false)
   const [releaseHistory, setReleaseHistory] = useState([])
   const messageApi = useMessage()
@@ -76,7 +76,7 @@ export const ReleaseHistoryModal = ({ open, onClose }) => {
       setReleaseHistory(res.data.releases || [])
     } catch (error) {
       console.error('加载历史版本失败:', error)
-      messageApi.error('加载历史版本失败')
+      messageApi.error(t('releaseHistory.loadFailed'))
     } finally {
       setLoading(false)
     }
@@ -88,9 +88,9 @@ export const ReleaseHistoryModal = ({ open, onClose }) => {
     <Modal
       title={
         <div className="flex items-center gap-2">
-          <span>更新日志</span>
+          <span>{t('releaseHistory.title')}</span>
           {latestVersion && (
-            <Tag color="green">最新版本: v{latestVersion}</Tag>
+            <Tag color="green">{t('releaseHistory.latestVersion', { version: latestVersion })}</Tag>
           )}
         </div>
       }
@@ -122,14 +122,14 @@ export const ReleaseHistoryModal = ({ open, onClose }) => {
                             {dayjs(release.publishedAt).format('YYYY-MM-DD HH:mm')}
                           </Text>
                         )}
-                        {index === 0 && <Badge status="processing" text="最新" />}
+                        {index === 0 && <Badge status="processing" text={t('releaseHistory.latest')} />}
                       </div>
                     ),
                     children: (
                       <div className="max-h-[300px] overflow-y-auto">
                         <div className="text-sm p-3 rounded" style={{ backgroundColor: 'var(--color-hover)' }}>
                           <ReactMarkdown components={markdownComponents}>
-                            {preprocessChangelog(release.changelog) || '暂无更新说明'}
+                            {preprocessChangelog(release.changelog) || t('releaseHistory.noChangelog')}
                           </ReactMarkdown>
                         </div>
                         {release.releaseUrl && (
@@ -140,7 +140,7 @@ export const ReleaseHistoryModal = ({ open, onClose }) => {
                             target="_blank"
                             className="mt-2 p-0"
                           >
-                            查看 GitHub Release
+                            {t('releaseHistory.viewGithub')}
                           </Button>
                         )}
                       </div>
@@ -151,7 +151,7 @@ export const ReleaseHistoryModal = ({ open, onClose }) => {
             }))}
           />
         ) : (
-          !loading && <div className="text-center text-gray-500 py-8">暂无版本信息</div>
+          !loading && <div className="text-center text-gray-500 py-8">{t('releaseHistory.noVersionInfo')}</div>
         )}
       </Spin>
     </Modal>

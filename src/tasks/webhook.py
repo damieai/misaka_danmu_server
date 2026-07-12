@@ -312,12 +312,18 @@ async def webhook_search_and_dispatch_task(
             episode_info=episode_info,
             alias_similarity_threshold=70,
         )
-        # 收集单源搜索耗时信息
+        # 收集单源搜索耗时信息（分组显示）
         from src.utils.search_timer import SubStepTiming
-        source_timing_sub_steps = [
-            SubStepTiming(name=name, duration_ms=dur, result_count=cnt)
-            for name, dur, cnt in manager.last_search_timing
-        ]
+        source_timing_sub_steps = []
+        for name, dur, cnt in manager.last_search_timing:
+            if name.startswith("补充:"):
+                source_timing_sub_steps.append(
+                    SubStepTiming(name=name[3:], duration_ms=dur, result_count=cnt, group="补充源")
+                )
+            else:
+                source_timing_sub_steps.append(
+                    SubStepTiming(name=name, duration_ms=dur, result_count=cnt, group="弹幕源")
+                )
         timer.step_end(details=f"{len(all_search_results)}个结果", sub_steps=source_timing_sub_steps)
 
         if not all_search_results:
@@ -535,8 +541,13 @@ async def webhook_search_and_dispatch_task(
 
                 # 获取精确标记信息
                 favorited_info = {}
+                # 库内已有源信息（复用前面已算好的 existing_source_keys，供 AI 优先复用库内源）
+                existing_info = {}
 
                 for result in all_search_results:
+                    source_key = f"{result.provider}:{result.mediaId}"
+                    if source_key in existing_source_keys:
+                        existing_info[source_key] = True
                     # 查找是否有相同provider和mediaId的源被标记
                     stmt = (
                         select(AnimeSource.isFavorited)
@@ -552,9 +563,17 @@ async def webhook_search_and_dispatch_task(
                         key = f"{result.provider}:{result.mediaId}"
                         favorited_info[key] = True
 
+                # 识别词认知校正上下文（统一函数，命中标记+提示文案；不改排序）
+                recognition_info, recognition_hint = (
+                    await title_recognition_manager.build_recognition_context_for_results(all_search_results)
+                    if title_recognition_manager else ({}, None)
+                )
+                if recognition_hint:
+                    query_info["recognition_hint"] = recognition_hint
+
                 # 使用AIMatcherManager进行匹配
                 ai_selected_index = await ai_matcher_manager.select_best_match(
-                    query_info, all_search_results, favorited_info
+                    query_info, all_search_results, favorited_info, existing_info, recognition_info
                 )
 
                 if ai_selected_index is not None:

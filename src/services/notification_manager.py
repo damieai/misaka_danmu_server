@@ -1,21 +1,31 @@
 """
-NotificationManager — 渠道动态加载与生命周期管理
+NotificationManager — 渠道动态加载与生命周期管理 + 统一通知出口
 参考 MediaServerManager 的多实例管理模式。
+
+C 方案重构后新增职责：
+- notify_event / notify_message / reply_message — 统一通知与交互出口
+- dispatch — 遍历已启用渠道并发送
+- render_for_channel — 按渠道能力选择 Markdown / 纯文本
+- 接入 MessageRegistry 和 NotificationAggregator
 """
 
+import asyncio
 import importlib
 import logging
 import pkgutil
-from typing import Callable, Dict, Optional, Any
+from typing import Callable, Dict, List, Optional, Any
 
 from src.db import crud
-from src.notification.base import BaseNotificationChannel
+from src.notification.base import BaseNotificationChannel, ChannelCapability, RenderedMessage
+from src.notification.messages.base import NotificationMessage
+from src.notification.messages.registry import MessageRegistry
+from src.notification.aggregation import NotificationAggregator
 
 logger = logging.getLogger(__name__)
 
 
 class NotificationManager:
-    """通知渠道管理器"""
+    """通知渠道管理器 + 统一通知出口"""
 
     def __init__(self, session_factory: Callable, notification_service):
         self._session_factory = session_factory
@@ -23,6 +33,12 @@ class NotificationManager:
         self.channels: Dict[int, BaseNotificationChannel] = {}  # channel_id -> instance
         self._channel_classes: Dict[str, type] = {}  # channel_type -> class
         self._discover_channel_classes()
+
+        # C 方案：消息注册表 & 聚合器
+        self._registry = MessageRegistry()
+        self._aggregator = NotificationAggregator(time_window=30.0, max_count=10)
+        self._flush_task: Optional[asyncio.Task] = None
+        self._register_message_types()
 
     def _discover_channel_classes(self):
         """自动发现 src/notification/ 下的渠道实现"""
@@ -41,6 +57,53 @@ class NotificationManager:
                         self._channel_classes[attr.channel_type] = attr
             except Exception as e:
                 logger.error(f"加载通知渠道模块 {modname} 失败: {e}", exc_info=True)
+
+    def _register_message_types(self):
+        """注册所有已知消息类型到注册表"""
+        from src.notification.messages.task import (
+            ImportMessage, AutoImportMessage, WebhookImportMessage,
+            RefreshMessage, IncrementalRefreshMessage,
+            ScheduledTaskMessage,
+            FallbackDownloadMessage, FallbackSearchMessage,
+            PredownloadMessage, MatchFallbackMessage,
+        )
+        from src.notification.messages.system import (
+            SystemStartMessage, WebhookTriggeredMessage,
+            MediaScanCompleteMessage, TaskProgressMessage,
+        )
+
+        self._registry.register_many({
+            # 导入类
+            "import_success": ImportMessage,
+            "import_failed": ImportMessage,
+            "auto_import_success": AutoImportMessage,
+            "auto_import_failed": AutoImportMessage,
+            "webhook_import_success": WebhookImportMessage,
+            "webhook_import_failed": WebhookImportMessage,
+            # 刷新类
+            "refresh_success": RefreshMessage,
+            "refresh_failed": RefreshMessage,
+            "incremental_refresh_success": IncrementalRefreshMessage,
+            "incremental_refresh_failed": IncrementalRefreshMessage,
+            # 定时任务
+            "scheduled_task_complete": ScheduledTaskMessage,
+            "scheduled_task_failed": ScheduledTaskMessage,
+            # 后备任务
+            "download_fallback_success": FallbackDownloadMessage,
+            "download_fallback_failed": FallbackDownloadMessage,
+            "fallback_search_success": FallbackSearchMessage,
+            "fallback_search_failed": FallbackSearchMessage,
+            "predownload_success": PredownloadMessage,
+            "predownload_failed": PredownloadMessage,
+            "match_fallback_success": MatchFallbackMessage,
+            "match_fallback_failed": MatchFallbackMessage,
+            # 系统
+            "system_start": SystemStartMessage,
+            "webhook_triggered": WebhookTriggeredMessage,
+            "media_scan_complete": MediaScanCompleteMessage,
+            "task_progress": TaskProgressMessage,
+        })
+        logger.debug(f"消息注册表初始化完成: {len(self._registry.get_all_types())} 种消息类型")
 
     async def _get_proxy_url(self) -> str:
         """从数据库读取全局代理 URL（仅 http_socks 模式下有效）"""
@@ -139,9 +202,21 @@ class NotificationManager:
                 await channel.start()
             except Exception as e:
                 logger.error(f"启动渠道失败: {channel.name} (id={ch_id}) - {e}", exc_info=True)
+        # 启动聚合刷新后台任务
+        self._flush_task = asyncio.create_task(self._start_flush_loop())
 
     async def stop_channels(self):
         """停止所有渠道"""
+        # 停止聚合刷新任务
+        if self._flush_task:
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
+            self._flush_task = None
+        # 刷新剩余聚合消息
+        await self.flush_aggregations()
         for ch_id, channel in list(self.channels.items()):
             try:
                 await channel.stop()
@@ -198,6 +273,8 @@ class NotificationManager:
             result.append({
                 "channelType": ch_type,
                 "displayName": cls.display_name,
+                "displayName_en": getattr(cls, "display_name_en", ""),
+                "displayName_tw": getattr(cls, "display_name_tw", ""),
                 "configSchema": cls.get_config_schema(),
                 "hideProxy": getattr(cls, "hide_proxy", False),
             })
@@ -208,4 +285,179 @@ class NotificationManager:
         if cls:
             return cls.get_config_schema()
         return None
+
+    # ═══════════════════════════════════════════
+    # C 方案：统一通知出口
+    # ═══════════════════════════════════════════
+
+    async def notify_event(self, event_type: str, payload: dict):
+        """业务层最常用入口 — 从事件创建消息对象并分发
+
+        Args:
+            event_type: 事件类型标识
+            payload: 业务数据字典
+        """
+        message = self._registry.create(event_type, payload)
+        if message is None:
+            # 未注册的消息类型，降级为直接发送
+            logger.warning(f"未注册的消息类型 [{event_type}]，使用直接发送")
+            await self._legacy_send(event_type, payload)
+            return
+
+        # 设置 message_type（注册表创建时未设置）
+        message.message_type = event_type
+
+        await self.notify_message(message)
+
+    async def notify_message(self, message: NotificationMessage):
+        """直接发送消息对象 — 经过聚合后分发"""
+        ready_messages = self._aggregator.collect(message)
+        for msg in ready_messages:
+            await self.dispatch(msg)
+
+    async def reply_message(self, reply: NotificationMessage,
+                            target_channel_id: Optional[int] = None):
+        """交互回复入口 — 发送到指定渠道"""
+        if target_channel_id:
+            channel = self.channels.get(target_channel_id)
+            if channel:
+                rendered = self.render_for_channel(reply, channel)
+                await channel.send_rendered(rendered)
+        else:
+            await self.dispatch(reply)
+
+    async def dispatch(self, message: NotificationMessage):
+        """遍历已启用渠道并发送消息
+
+        检查每个渠道的事件订阅配置，只发送给订阅了的渠道。
+        """
+        # 聚合海报（如后备搜索九宫格）：仅生成一次，复用给所有图片渠道，避免重复下载绘制。
+        # _collage_cache: None=尚未尝试; False=已尝试但无图; bytes=已生成
+        _collage_cache: Any = None
+        _collage_tried = False
+
+        for ch_id, channel in self.channels.items():
+            try:
+                if not self._check_subscription(channel, message):
+                    continue
+                rendered = self.render_for_channel(message, channel)
+                # 仅对支持图片的渠道尝试附加聚合海报（异步，不阻塞业务主流程——
+                # 通知本身已在任务完成后异步发出）。失败静默降级为纯文字。
+                caps = channel.get_capabilities()
+                if caps.supports(ChannelCapability.IMAGES):
+                    if not _collage_tried:
+                        _collage_tried = True
+                        _collage_cache = await self._build_collage_for(message)
+                    if _collage_cache:
+                        rendered.image_bytes = _collage_cache
+                await channel.send_rendered(rendered)
+            except Exception as e:
+                logger.error(f"渠道 {ch_id} 发送消息 [{message.message_type}] 失败: {e}")
+
+    async def _build_collage_for(self, message: NotificationMessage) -> Optional[bytes]:
+        """为消息生成聚合海报（PNG bytes）。受配置开关与代理控制，全程容错返回 None。
+
+        why：海报聚合是可选增强，任何环节失败都不应影响通知发出，故吞掉所有异常。
+        """
+        try:
+            # 读取开关与代理配置（一次 dispatch 仅调用一次）
+            enabled = True
+            proxy = None
+            ssl_verify = True
+            try:
+                async with self._session_factory() as session:
+                    enabled = (await crud.get_config_value(
+                        session, "fallbackSearchPosterCollage", "true")).lower() == "true"
+                    proxy_enabled = (await crud.get_config_value(
+                        session, "proxyEnabled", "false")).lower() == "true"
+                    proxy_url = await crud.get_config_value(session, "proxyUrl", "")
+                    ssl_verify = (await crud.get_config_value(
+                        session, "proxySslVerify", "true")).lower() == "true"
+                    proxy = proxy_url if (proxy_enabled and proxy_url) else None
+            except Exception:
+                pass
+            if not enabled:
+                return None
+            return await message.build_image_bytes(proxy=proxy, ssl_verify=ssl_verify)
+        except Exception as e:
+            logger.debug(f"生成聚合海报失败（忽略，降级纯文字）: {e}")
+            return None
+
+    def render_for_channel(self, message: NotificationMessage,
+                           channel: BaseNotificationChannel) -> RenderedMessage:
+        """按渠道能力选择 Markdown 或纯文本渲染"""
+        caps = channel.get_capabilities()
+        supports_rich = caps.supports(ChannelCapability.RICH_TEXT)
+
+        if supports_rich:
+            title, body = message.to_markdown()
+            fmt = "markdown"
+        else:
+            title, body = message.to_text()
+            fmt = "text"
+
+        return RenderedMessage(
+            title=title,
+            body=body,
+            format=fmt,
+            image=message.image(),
+            buttons=message.buttons(),
+            edit_message_id=message.edit_policy(),
+        )
+
+    def render_event_for_channel(self, event_type: str, payload: dict,
+                                 channel: BaseNotificationChannel) -> Optional[RenderedMessage]:
+        """根据 event_type + payload 为指定渠道生成 RenderedMessage。
+
+        供 notification_service 的进度 edit / 完成消息 edit 路径复用统一消息类，
+        避免维护重复的格式化模板。未注册的事件类型返回 None。
+        """
+        message = self._registry.create(event_type, payload)
+        if message is None:
+            return None
+        message.message_type = event_type
+        return self.render_for_channel(message, channel)
+
+    @staticmethod
+    def _check_subscription(channel: BaseNotificationChannel,
+                            message: NotificationMessage) -> bool:
+        """检查渠道是否订阅了此消息类型"""
+        events_cfg = channel.config.get("__events_config", {})
+        sub_key = message.subscription_key
+        if not sub_key:
+            return True  # 无订阅 key 的消息默认发送
+        return bool(events_cfg.get(sub_key, False))
+
+    async def flush_aggregations(self):
+        """手动刷新所有聚合消息"""
+        messages = self._aggregator.flush_all()
+        for msg in messages:
+            await self.dispatch(msg)
+
+    async def _start_flush_loop(self):
+        """定时刷新聚合桶的后台任务"""
+        while True:
+            try:
+                await asyncio.sleep(10)
+                messages = self._aggregator.flush_expired()
+                for msg in messages:
+                    await self.dispatch(msg)
+                self._aggregator.cleanup_expired()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"聚合刷新异常: {e}")
+
+    async def _legacy_send(self, event_type: str, payload: dict):
+        """降级发送 — 直接用旧格式发送未注册的消息类型"""
+        title = event_type
+        text = payload.get("text", "") or payload.get("message", "") or str(payload)
+        for ch_id, channel in self.channels.items():
+            try:
+                events_cfg = channel.config.get("__events_config", {})
+                if not events_cfg.get(event_type, False):
+                    continue
+                await channel.send_message(title=title, text=text)
+            except Exception as e:
+                logger.error(f"渠道 {ch_id} 降级发送 [{event_type}] 失败: {e}")
 
